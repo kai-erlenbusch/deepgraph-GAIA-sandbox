@@ -1,11 +1,12 @@
 import { defineConfig } from 'vite';
 
 export default defineConfig({
+  root: '.',
   server: {
-    port: 5178,
+    port: 5173,
     open: false,
     watch: {
-      ignored: ['**/public/data/**']
+      ignored: ['**/public/data/**', '**/public/tiles/**']
     }
   },
   build: {

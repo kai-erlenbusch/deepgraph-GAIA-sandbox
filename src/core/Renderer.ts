@@ -65,6 +65,13 @@ export class Renderer {
     if (this.raycaster.ray.intersectPlane(this.plane, intersection)) {
       // 2. Calculate zoom factor
       const zoomFactor = event.deltaY > 0 ? 1.1 : 0.9;
+      
+      // Prevent zooming so close that WebGPU Float32 precision breaks down!
+      const currentDist = this.camera.position.distanceTo(this.controls.target);
+      if (zoomFactor < 1.0 && currentDist < 0.2) {
+        return;
+      }
+      
       const alpha = 1 - zoomFactor;
       
       // 3. Move camera and target perfectly towards (or away from) the mouse intersection

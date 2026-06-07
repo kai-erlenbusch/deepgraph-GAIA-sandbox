@@ -3,12 +3,56 @@ import { MeshBasicNodeMaterial } from 'three/webgpu';
 import { 
   attribute, float, positionLocal, vec3, vec2, uv, distance, smoothstep,
   fwidth, hash, instanceIndex, Discard, max, min, userData, uint, mix,
-  log2, clamp, pow, uniformArray, uniform, select, varying
+  log2, clamp, pow, uniformArray, uniform, select
 } from 'three/tsl';
 import { Renderer } from './core/Renderer';
 import { TileManager, BoundingBox, TileData } from './data/TileManager';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
-const TILE_SERVER_URL = '/data';
+// --- ON-SCREEN DEBUGGER ---
+const debugDiv = document.createElement('div');
+debugDiv.style.position = 'absolute';
+debugDiv.style.bottom = '10px';
+debugDiv.style.left = '10px';
+debugDiv.style.width = '600px';
+debugDiv.style.height = '300px';
+debugDiv.style.overflowY = 'auto';
+debugDiv.style.backgroundColor = 'rgba(0,0,0,0.8)';
+debugDiv.style.color = '#00ff00';
+debugDiv.style.fontFamily = 'monospace';
+debugDiv.style.fontSize = '12px';
+debugDiv.style.padding = '10px';
+debugDiv.style.pointerEvents = 'none';
+debugDiv.style.zIndex = '9999';
+document.body.appendChild(debugDiv);
+
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+
+function logToScreen(msg: string, color: string) {
+  const line = document.createElement('div');
+  line.style.color = color;
+  line.innerText = msg;
+  debugDiv.appendChild(line);
+  debugDiv.scrollTop = debugDiv.scrollHeight;
+}
+
+console.log = (...args) => {
+  originalLog(...args);
+  logToScreen(args.map(a => String(a)).join(' '), '#00ff00');
+};
+console.warn = (...args) => {
+  originalWarn(...args);
+  logToScreen(args.map(a => String(a)).join(' '), '#ffff00');
+};
+console.error = (...args) => {
+  originalError(...args);
+  logToScreen(args.map(a => String(a)).join(' '), '#ff0000');
+};
+// --------------------------
+
+const TILE_SERVER_URL = '/tiles';
 
 // --- Shader-Side Color Palettes ---
 const warmPaletteColors = ['#ffeda0', '#feb24c', '#f03b20', '#bcbddc', '#756bb1'];
@@ -42,8 +86,8 @@ let scatterplotInstance: Scatterplot | null = null;
 (window as any).swapMode = () => {
   is2DMode = !is2DMode;
   if (scatterplotInstance) {
-    // 0.0 perfectly flattens the points. 2.0 extrudes them.
-    scatterplotInstance.layerSpacingUniform.value = is2DMode ? 0.0 : 2.0;
+    // 0.0 perfectly flattens the points. 1.0 extrudes them based on real Z-topo.
+    scatterplotInstance.layerSpacingUniform.value = is2DMode ? 0.0 : 1.0;
   }
   if (rendererInstance) {
     rendererInstance.set2DMode(is2DMode);
@@ -63,13 +107,9 @@ class Scatterplot {
 
   private pickingScene: THREE.Scene;
   private pickingMaterial: MeshBasicNodeMaterial;
-  private pickingMeshes: Map<string, THREE.Mesh> = new Map();
-  private globalPickingId = 1; // start at 1, since 0 is background
-  public pickingMap: Map<number, { tileKey: string, rowIndex: number }> = new Map();
-  
   public hoverMesh: THREE.Mesh;
   public hoverColorUniform: any;
-  public layerSpacingUniform = uniform(float(2.0));
+  public layerSpacingUniform = uniform(1.0); // Default 2.5D mode is 1.0 multiplier
 
   constructor(scene: THREE.Scene, rendererWrapper: Renderer) {
     this.scene = scene;
@@ -96,7 +136,8 @@ class Scatterplot {
     // Dynamic Size Curve
     // Smoothly interpolate size from 1.2px at Zoom 0 to 4.0px at Zoom 6
     const targetPixels = mix(float(1.2), float(4.0), zoomT); 
-    const size = targetPixels.mul(rendererWrapper.worldUnitsPerPixelUniform);
+    const instanceSize = attribute('instanceSize', 'float');
+    const size = targetPixels.mul(rendererWrapper.worldUnitsPerPixelUniform).mul(instanceSize);
     
     // Calculate distance from the quad's center (0.5, 0.5)
     const dist = distance(uv(), vec2(0.5));
@@ -105,9 +146,11 @@ class Scatterplot {
     // Dynamically reads the physical density of the current tile from CPU!
     // Zoom-based Dynamic Opacity
     // To combat single-pass additive blowout, we reduce opacity exponentially as we zoom out
+    const tileDensity = userData('density', 'float');
     const baseOpacity = float(0.15); // max opacity at Zoom 0
     const negativeDecay = pow(float(2.0), min(float(0.0), currentZoom));
-    const dynamicOpacity = baseOpacity.mul(negativeDecay);
+    // Divide opacity by physical density to normalize dense vs sparse tiles. Multiply by scalar to keep it visible.
+    const dynamicOpacity = baseOpacity.mul(negativeDecay).div(max(tileDensity, float(0.0001))).mul(float(100.0));
     
     // "Elite Memory Trick": Shader-Side Color Palette
     const baseColorAttribute = attribute('instanceColor', 'vec4');
@@ -124,7 +167,8 @@ class Scatterplot {
     
     // --- FRAGMENT SHADER STAGE ---
     // Edge Softening (Combined with Hardware Anti-Aliasing)
-    const delta = fwidth(dist);
+    // We multiply delta by 0.5 to force the edge blend to exactly 1 screen pixel (ultra-crisp)
+    const delta = fwidth(dist).mul(0.5);
     const sharpInnerEdge = float(0.5).sub(delta);
     const sharpOuterEdge = float(0.5).add(delta);
     
@@ -132,53 +176,36 @@ class Scatterplot {
     // Always use sharpInnerEdge < sharpOuterEdge, and subtract from 1.0 to invert the mask.
     const alphaEdge = float(1.0).sub(smoothstep(sharpInnerEdge, max(sharpOuterEdge, sharpInnerEdge.add(float(0.001))), dist));
     
-    const finalAlpha = alphaEdge.mul(dynamicOpacity);
+    // Sub-pixel hardware anti-aliasing crash prevention
+    // targetPixels is the actual size in screen pixels. Compare that to 1.0!
+    const sizeInPixels = targetPixels.mul(instanceSize);
+    const isSubPixel = sizeInPixels.lessThan(float(1.0));
+    const finalAlpha = select(isSubPixel, dynamicOpacity, alphaEdge.mul(dynamicOpacity));
     
     // Stochastic Sub-pixel Dithering
     const randomVal = hash(instanceIndex).mul(float(255.0));
     const isSubPixelOpacity = finalAlpha.lessThan(threshold);
     const probDiscard = randomVal.greaterThan(finalAlpha.mul(float(255.0)));
     
-    Discard(isSubPixelOpacity.and(probDiscard));
+    // Instead of TSL Discard (which gets optimized out), we explicitly set alpha to 0.0!
+    // We discard if it's the empty corner (dist > 0.5) OR if stochastic dithering failed!
+    const shouldDiscard = dist.greaterThan(0.5).or(isSubPixelOpacity.and(probDiscard));
     
-    const safeAlpha = max(finalAlpha, threshold);
+    const safeAlpha = select(shouldDiscard, float(0.0), max(finalAlpha, threshold));
     
     this.material.colorNode = paletteColor.mul(safeAlpha);
     this.material.opacityNode = safeAlpha;
     
     // World position: instance offset + local vertex position * culledSize
-    // 1. Define how far apart the layers should be (e.g., 2.0 World Units)
-    // 2. Extrude the Z-axis based on the category color index (0 through 4)
-    // This will stack the colors like 5 panes of glass
-    const zDepth = float(colorIndex).mul(this.layerSpacingUniform);
-    // 3. Apply it to the 3D offset!
-    const offset2D = attribute('offset', 'vec2');
-    const offset3D = vec3(offset2D.x, offset2D.y, zDepth);
+    const offset3DAttr = attribute('offset', 'vec3'); // Now it has X, Y, Z directly from geomBuffer
+    
+    // Extrude the Z-axis based on the continuous physical Topo Z mapping
+    const finalZ = offset3DAttr.z.mul(this.layerSpacingUniform);
+    const offset3D = vec3(offset3DAttr.x, offset3DAttr.y, finalZ);
     
     this.material.positionNode = offset3D.add(positionLocal.mul(culledSize));
 
-    // Picking Setup
-    this.pickingScene = new THREE.Scene();
-    this.pickingScene.background = new THREE.Color(0x000000); // 0 is null id
-    this.pickingMaterial = new MeshBasicNodeMaterial({
-      depthWrite: false,
-      blending: THREE.NoBlending,
-      side: THREE.DoubleSide // Allow picking from behind!
-    });
-    
-    // Mathematically derive unique RGB picking color on the GPU
-    const tileStartId = userData('tileStartId', 'uint');
-    const globalId = tileStartId.add(uint(instanceIndex));
-    
-    const r = globalId.shiftRight(16).bitAnd(255);
-    const g = globalId.shiftRight(8).bitAnd(255);
-    const b = globalId.bitAnd(255);
-    
-    this.pickingMaterial.colorNode = vec3(float(r), float(g), float(b)).div(255.0);
-    
-    // Fat Pointers for Picking (2.0x size) using the identical zDepth extrusion!
-    const pickingSize = culledSize.mul(float(2.0));
-    this.pickingMaterial.positionNode = offset3D.add(positionLocal.mul(pickingSize));
+    // WebGPU Picking Material completely removed in favor of CPU Raycasting!
     
     // Create Ghost Mesh for UI Hover
     // We create a normalized PlaneGeometry to use custom TSL UV distance math
@@ -210,13 +237,27 @@ class Scatterplot {
       if (!currentKeys.has(key)) {
         this.scene.remove(mesh);
         mesh.geometry.dispose();
+        mesh.userData.hoverBuffer = null;
         this.tileMeshes.delete(key);
-        
-        const pickingMesh = this.pickingMeshes.get(key);
-        if (pickingMesh) {
-          this.pickingScene.remove(pickingMesh);
-          this.pickingMeshes.delete(key);
+      }
+    }
+
+    // Check if any existing tiles need semantic updates
+    for (const tile of tiles) {
+      if (tile.needsUpdate) {
+        const mesh = this.tileMeshes.get(tile.key);
+        if (mesh && tile.colorBuffer && tile.sizeBuffer) {
+          const colorAttr = mesh.geometry.attributes.instanceColor as THREE.InstancedBufferAttribute;
+          colorAttr.array.set(new Uint8Array(tile.colorBuffer));
+          colorAttr.needsUpdate = true;
+          
+          const sizeAttr = mesh.geometry.attributes.instanceSize as THREE.InstancedBufferAttribute;
+          sizeAttr.array.set(new Float32Array(tile.sizeBuffer));
+          sizeAttr.needsUpdate = true;
+          
+          mesh.userData.hoverBuffer = new Int32Array(tile.hoverBuffer!);
         }
+        tile.needsUpdate = false;
       }
     }
 
@@ -235,18 +276,27 @@ class Scatterplot {
     instancedGeometry.attributes.position = this.quadGeometry.attributes.position;
     instancedGeometry.attributes.uv = this.quadGeometry.attributes.uv;
 
-    // INTERLEAVED BUFFER (16 bytes per point)
-    const bufferF32 = new THREE.InstancedInterleavedBuffer(new Float32Array(tile.interleavedBuffer), 4);
-    const bufferU8 = new THREE.InstancedInterleavedBuffer(new Uint8Array(tile.interleavedBuffer), 16);
+    // 1. GEOMETRY BUFFER (12 bytes per point)
+    const geomBuffer = new THREE.InstancedInterleavedBuffer(new Float32Array(tile.geomBuffer!), 3);
+    instancedGeometry.setAttribute('offset', new THREE.InterleavedBufferAttribute(geomBuffer, 3, 0));
 
-    // Map the views to the shader attributes. 
-    // We intentionally ignore bytes 8-11 (formerly instanceSize) to maintain a fast 16-byte power-of-two stride,
-    // while forcing all points to a microscopic 1.4 physical pixels in the shader.
-    instancedGeometry.setAttribute('offset', new THREE.InterleavedBufferAttribute(bufferF32, 2, 0));
-    instancedGeometry.setAttribute('instanceColor', new THREE.InterleavedBufferAttribute(bufferU8, 4, 12, true));
+    // 2. DUMMY SEMANTIC BUFFERS (Pre-allocated for WebGPU compilation!)
+    const colorArray = new Uint8Array(tile.colorBuffer || new ArrayBuffer(tile.numRows * 4));
+    if (!tile.colorBuffer) {
+        for(let i=0; i<tile.numRows; i++) {
+           colorArray[i*4+0] = 128; // gray fallback
+           colorArray[i*4+1] = 128;
+           colorArray[i*4+2] = 128;
+           colorArray[i*4+3] = 255;
+        }
+    }
+    instancedGeometry.setAttribute('instanceColor', new THREE.InstancedBufferAttribute(colorArray, 4, true));
 
-    const startId = this.globalPickingId;
-    this.globalPickingId += tile.numRows;
+    const sizeArray = new Float32Array(tile.sizeBuffer || new ArrayBuffer(tile.numRows * 4));
+    if (!tile.sizeBuffer) {
+        for(let i=0; i<tile.numRows; i++) sizeArray[i] = 1.0; // fallback size
+    }
+    instancedGeometry.setAttribute('instanceSize', new THREE.InstancedBufferAttribute(sizeArray, 1));
 
     const mesh = new THREE.Mesh(instancedGeometry, this.material);
     mesh.frustumCulled = false; // We handle culling manually via TileManager
@@ -254,59 +304,75 @@ class Scatterplot {
     // Calculate physical density and pass to the shader via userData
     // TileData doesn't have bounds, but we can calculate exact area from Z index!
     const [z] = tile.key.split('/').map(Number);
-    const rootArea = 40.2228 * 40.2228; // Extracted from root bounds
+    const rootArea = 40.14673 * 40.30325; // Extracted from root bounds
     const area = rootArea / Math.pow(4, z);
     mesh.userData.density = tile.numRows / area;
     
+    mesh.userData.hoverBuffer = tile.hoverBuffer ? new Int32Array(tile.hoverBuffer) : null;
+    
     this.scene.add(mesh);
     this.tileMeshes.set(tile.key, mesh);
-
-    const pickingMesh = new THREE.Mesh(instancedGeometry, this.pickingMaterial);
-    pickingMesh.frustumCulled = false;
-    pickingMesh.userData.tileStartId = startId;
-    this.pickingScene.add(pickingMesh);
-    this.pickingMeshes.set(tile.key, pickingMesh);
-    
-    for (let i = 0; i < tile.numRows; i++) {
-      this.pickingMap.set(startId + i, { tileKey: tile.key, rowIndex: i });
-    }
   }
 
-  public getPickingScene() {
-    return this.pickingScene;
-  }
-
-  public updateHover(id: number) {
-    if (id === 0) {
+  public updateHover(tileKey: string, rowIndex: number, tooltipHtmlCallback: (html: string) => void) {
+    if (tileKey === "") {
       this.hoverMesh.visible = false;
       return;
     }
-    const data = this.pickingMap.get(id);
-    if (!data) return;
-    const mesh = this.tileMeshes.get(data.tileKey);
+    const mesh = this.tileMeshes.get(tileKey);
     if (!mesh) return;
 
-    // The interleaved buffer contains 4 floats (16 bytes) per instance.
-    const bufferF32 = mesh.geometry.attributes.offset.data.array as Float32Array;
-    const bufferU8 = mesh.geometry.attributes.instanceColor.data.array as Uint8Array;
+    const bufferF32 = (mesh.geometry.attributes.offset as THREE.InterleavedBufferAttribute).data.array as Float32Array;
+    const bufferU8 = (mesh.geometry.attributes.instanceColor as THREE.InstancedBufferAttribute).array as Uint8Array;
     
-    const row = data.rowIndex;
-    // float offset is 4 elements per row (x, y, null, null)
-    const x = bufferF32[row * 4 + 0];
-    const y = bufferF32[row * 4 + 1];
+    const row = rowIndex;
+    const x = bufferF32[row * 3 + 0];
+    const y = bufferF32[row * 3 + 1];
+    const z = bufferF32[row * 3 + 2];
     
-    // byte offset is 16 elements per row, color starts at byte 12
-    const r = bufferU8[row * 16 + 12];
+    const r = bufferU8[row * 4 + 0];
     const colorIndex = r % 5;
-    // Dynamically multiply by the uniform so the Ghost Mesh instantly drops to Z=0 in 2D mode!
-    const zDepth = colorIndex * this.layerSpacingUniform.value;
+    
+    // Extrude based on topo z mapping. 
+    // We do NOT add +0.01 to zDepth because it causes perspective skew. 
+    // depthTest: false already guarantees it draws on top!
+    const zDepth = z * (this.layerSpacingUniform.value as number);
 
     // Sync Ghost Mesh color to the actual palette!
     const activePalette = isWarmPalette ? warmPaletteColors : coolPaletteColors;
     this.hoverColorUniform.value.set(activePalette[colorIndex]);
 
-    this.hoverMesh.position.set(x, y, zDepth + 0.01);
+    this.hoverMesh.position.set(x, y, zDepth);
+    
+    // Calculate the exact world size of the dot so the Ghost Mesh wraps it perfectly
+    const worldUnitsPerPixel = rendererInstance!.worldUnitsPerPixelUniform.value as number;
+    const currentZoom = Math.log2(0.04 / worldUnitsPerPixel);
+    const zoomT = Math.max(0, Math.min(1, Math.max(0, currentZoom) / 6.0));
+    const targetPixels = 1.2 * (1 - zoomT) + 4.0 * zoomT;
+    
+    let instanceSize = 1.0;
+    if (mesh.geometry.attributes.instanceSize) {
+      const sizeAttr = (mesh.geometry.attributes.instanceSize as THREE.InstancedBufferAttribute).array as Float32Array;
+      instanceSize = sizeAttr[row];
+    }
+    
+    // Scale by 4.0x to create a massive "Magnification" hover effect!
+    const physicalSize = targetPixels * instanceSize * worldUnitsPerPixel * 4.0;
+    this.hoverMesh.scale.set(physicalSize, physicalSize, 1.0);
+    
     this.hoverMesh.visible = true;
+    
+    let hoverText = `Tile: ${tileKey}<br/>Row: ${rowIndex}`;
+    if (mesh.userData.hoverBuffer) {
+       const hb = mesh.userData.hoverBuffer as Int32Array;
+       const global_id = hb[row * 3 + 0];
+       const model_id = hb[row * 3 + 1];
+       const num_of_tokens = hb[row * 3 + 2];
+       hoverText = `Global ID: ${global_id}<br/>Model ID: ${model_id}<br/>Tokens: ${num_of_tokens}`;
+    } else {
+       hoverText += `<br/><i>Loading semantic data...</i>`;
+    }
+    tooltipHtmlCallback(hoverText);
   }
 }
 
@@ -322,14 +388,35 @@ async function init() {
   const rendererWrapper = new Renderer(container);
   await rendererWrapper.init();
 
-  // Real LMSys dataset bounds calculated by build_quadtree.py
-  const rootBounds: BoundingBox = { 
-    minX: -13.004743576049805, 
-    maxX: 27.21806526184082, 
-    minY: -18.281795501708984, 
-    maxY: 21.94101333618164 
-  };
-  const tileManager = new TileManager(TILE_SERVER_URL, rootBounds);
+  // Dynamically fetch dataset boundaries!
+  let rootBounds: BoundingBox;
+  let validTiles = new Set<string>();
+  try {
+    const res = await fetch(`${TILE_SERVER_URL}/index.json`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const indexData = await res.json();
+    rootBounds = { 
+      minX: indexData.global_bounds.min_x, 
+      maxX: indexData.global_bounds.max_x, 
+      minY: indexData.global_bounds.min_y, 
+      maxY: indexData.global_bounds.max_y 
+    };
+    if (indexData.tiles) {
+      validTiles = new Set(indexData.tiles);
+    }
+  } catch (err) {
+    console.error("Failed to fetch index.json, using fallback bounds.", err);
+    // Fallback if index.json fails
+    rootBounds = { 
+      minX: -12.966705322265625, 
+      maxX: 27.180025100708008, 
+      minY: -18.322017669677734, 
+      maxY: 21.98123550415039 
+    };
+    validTiles.clear(); // Ensure it is empty so TileManager ignores it
+  }
+  
+  const tileManager = new TileManager(TILE_SERVER_URL, rootBounds, validTiles);
   
   uiText.innerHTML = `WebGPU is supported!<br/>Streaming Quadtree Tiles...`;
 
@@ -339,21 +426,8 @@ async function init() {
   rendererInstance = rendererWrapper;
   scatterplotInstance = scatterplot;
 
-  const pickingTexture = new THREE.RenderTarget(window.innerWidth, window.innerHeight, {
-    colorSpace: THREE.NoColorSpace
-  });
-  window.addEventListener('resize', () => {
-    pickingTexture.setSize(window.innerWidth, window.innerHeight);
-  });
-
   const mouse = new THREE.Vector2();
-  let mouseMoved = false;
-
-  window.addEventListener('mousemove', (e) => {
-    mouse.x = e.clientX;
-    mouse.y = e.clientY;
-    mouseMoved = true;
-  });
+  let lastMouseMoveTime = 0;
 
   const tooltip = document.createElement('div');
   tooltip.style.position = 'absolute';
@@ -366,60 +440,127 @@ async function init() {
   tooltip.style.zIndex = '1000';
   document.body.appendChild(tooltip);
 
-  rendererWrapper.renderer.setAnimationLoop(async () => {
+  const raycaster = new THREE.Raycaster();
+
+  function performCPUPicking(mouseX: number, mouseY: number) {
+    const ndcX = (mouseX / window.innerWidth) * 2 - 1;
+    const ndcY = -(mouseY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), rendererWrapper.camera);
+
+    const layerSpacing = scatterplot.layerSpacingUniform.value as number;
+    const worldUnitsPerPixel = rendererWrapper.worldUnitsPerPixelUniform.value as number;
+    
+    // 1. Mirror the Shader's Camera Math
+    const currentZoom = Math.log2(0.04 / worldUnitsPerPixel);
+    const zoomT = Math.max(0, Math.min(1, Math.max(0, currentZoom) / 6.0));
+    const targetPixels = 1.2 * (1 - zoomT) + 4.0 * zoomT;
+    
+    let closestTileKey = "";
+    let closestRowIndex = -1;
+    let closestTileZ = -1;
+    let minDistToCenter = Infinity;
+    
+    const pt = new THREE.Vector3(); // Pre-allocate to prevent GC memory leaks
+
+    for (const t of tileManager.activeTiles) {
+      if (!t.geomBuffer) continue;
+      
+      // QUAD-TREE CULLING: mathematically reject entirely irrelevant tiles!
+      // We must expand the bounding box by the maximum visual radius of the points
+      // to prevent "Dead Zones" when hovering over the edge of a massive dot!
+      const node = tileManager.nodeMap.get(t.key);
+      if (node) {
+        const maxRadiusWorld = (targetPixels * 10.0 / 2.0) * worldUnitsPerPixel; // 10.0 is safe max instanceSize
+        const expandedBox = node.box3.clone().expandByScalar(maxRadiusWorld);
+        if (!raycaster.ray.intersectsBox(expandedBox)) {
+          continue;
+        }
+      }
+      
+      const tileZ = Number(t.key.split('/')[0]);
+      const geomArray = new Float32Array(t.geomBuffer);
+      const sizeArray = t.sizeBuffer ? new Float32Array(t.sizeBuffer) : null;
+      const mesh = scatterplot.tileMeshes.get(t.key);
+      if (!mesh) continue;
+
+      for (let i = 0; i < t.numRows; i++) {
+        pt.set(
+          geomArray[i * 3 + 0],
+          geomArray[i * 3 + 1],
+          geomArray[i * 3 + 2] * layerSpacing
+        );
+        
+        // 2. Project 3D Coordinates to 2D Screen Pixels
+        pt.project(rendererWrapper.camera);
+        // pt.x and pt.y are in Normalized Device Coordinates (-1 to 1)
+        const screenX = (pt.x + 1) / 2 * window.innerWidth;
+        const screenY = -(pt.y - 1) / 2 * window.innerHeight;
+        
+        // 3. Screen-Space Hit Detection
+        const instanceSize = sizeArray ? sizeArray[i] : 1.0;
+        const screenRadius = (targetPixels * instanceSize) / 2.0;
+        
+        const dx = mouseX - screenX;
+        const dy = mouseY - screenY;
+        const distToCenter = Math.sqrt(dx*dx + dy*dy);
+        
+        // Always prioritize the point physically closest to the mouse!
+        // Only use tileZ (Zoom Level) as a tie-breaker if distances are extremely close (< 1 pixel)
+        if (distToCenter <= screenRadius) {
+          if (distToCenter < minDistToCenter - 1.0 || (Math.abs(distToCenter - minDistToCenter) <= 1.0 && tileZ > closestTileZ)) {
+            closestTileKey = t.key;
+            closestRowIndex = i;
+            closestTileZ = tileZ;
+            minDistToCenter = distToCenter;
+          }
+        }
+      }
+    }
+    
+    if (closestTileKey !== "") {
+      scatterplot.updateHover(closestTileKey, closestRowIndex, (hoverHtml) => {
+        tooltip.style.display = 'block';
+        tooltip.style.left = mouseX + 15 + 'px';
+        tooltip.style.top = mouseY + 15 + 'px';
+        tooltip.style.fontFamily = 'monospace';
+        tooltip.innerHTML = hoverHtml;
+      });
+    } else {
+      scatterplot.updateHover("", -1, () => {});
+      tooltip.style.display = 'none';
+    }
+  }
+
+  let isPicking = false;
+  window.addEventListener('mousemove', (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+    
+    if (!isPicking) {
+      isPicking = true;
+      requestAnimationFrame(() => {
+        performCPUPicking(mouse.x, mouse.y);
+        isPicking = false;
+      });
+    }
+  });
+
+  rendererWrapper.renderer.setAnimationLoop(() => {
     try {
       // 1. Get frustum
       const frustum = rendererWrapper.getFrustum();
-      const zoomLevel = Math.max(0, Math.floor(Math.log2(rendererWrapper.zoomUniform.value)));
-      
-      // 2. Fetch visible tiles
-      const visibleTiles = await tileManager.getVisibleTiles(frustum, zoomLevel);
+      // 2. Fetch visible tiles (synchronously triggers background fetches)
+      const visibleTiles = tileManager.getVisibleTiles(frustum, rendererWrapper.camera.position);
       
       // 3. Update scatterplot geometry
       scatterplot.updateTiles(visibleTiles);
       
       let totalPoints = 0;
       for (const t of visibleTiles) totalPoints += t.numRows;
-      uiText.innerHTML = `Streaming Quadtree<br/>Tiles rendered: ${visibleTiles.length}<br/>Points: ${totalPoints}<br/>Zoom Level: ${zoomLevel}`;
+      uiText.innerHTML = `Streaming Quadtree<br/>Tiles rendered: ${visibleTiles.length}<br/>Points: ${totalPoints}`;
 
-      // 4. Render
+      // 4. Render Main Scene
       rendererWrapper.render();
-      
-      // Deepscatter Magnification: Base size * 4.0x
-      const magnifiedSize = 3.0 * 4.0; 
-      scatterplot.hoverMesh.scale.setScalar(rendererWrapper.worldUnitsPerPixelUniform.value * magnifiedSize);
-
-      // 5. Picking Pass
-      if (mouseMoved) {
-        mouseMoved = false;
-        
-        // Fix Picking Pass: Render only the 1x1 pixel under the mouse
-        rendererWrapper.camera.setViewOffset(window.innerWidth, window.innerHeight, mouse.x, mouse.y, 1, 1);
-        
-        rendererWrapper.renderer.setRenderTarget(pickingTexture);
-        rendererWrapper.renderer.render(scatterplot.getPickingScene(), rendererWrapper.camera);
-        rendererWrapper.renderer.setRenderTarget(null);
-        
-        rendererWrapper.camera.clearViewOffset();
-        
-        // WebGPU render targets use a Top-Left origin (0,0 is top-left), exactly matching the mouse!
-        // Read from 0,0 since we only rendered a 1x1 texture
-        const pixelBuffer = await rendererWrapper.renderer.readRenderTargetPixelsAsync(pickingTexture, 0, 0, 1, 1);
-        
-        const id = (pixelBuffer[0] << 16) | (pixelBuffer[1] << 8) | pixelBuffer[2];
-        if (id > 0 && scatterplot.pickingMap.has(id)) {
-          scatterplot.updateHover(id);
-          const data = scatterplot.pickingMap.get(id)!;
-          tooltip.style.display = 'block';
-          tooltip.style.left = mouse.x + 15 + 'px';
-          tooltip.style.top = mouse.y + 15 + 'px';
-          tooltip.style.fontFamily = 'monospace';
-          tooltip.innerHTML = `Tile: ${data.tileKey}<br/>Row: ${data.rowIndex}<br/>Global ID: ${id}`;
-        } else {
-          scatterplot.updateHover(0);
-          tooltip.style.display = 'none';
-        }
-      }
     } catch (err) {
       console.error("Animation loop crash:", err);
       rendererWrapper.renderer.setAnimationLoop(null); // Stop loop to avoid 3000 errors
