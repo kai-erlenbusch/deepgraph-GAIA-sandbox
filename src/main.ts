@@ -461,6 +461,14 @@ async function init() {
     let minDistToCenter = Infinity;
     
     const pt = new THREE.Vector3(); // Pre-allocate to prevent GC memory leaks
+    
+    // O(1) World-Space Optimization for 2D Mode
+    const is2DMode = layerSpacing === 0.0;
+    const mouseWorld = new THREE.Vector3();
+    const targetZPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    raycaster.ray.intersectPlane(targetZPlane, mouseWorld);
+    
+    const worldRadiusBase = (targetPixels / 2.0) * worldUnitsPerPixel;
 
     for (const t of tileManager.activeTiles) {
       if (!t.geomBuffer) continue;
@@ -484,34 +492,54 @@ async function init() {
       if (!mesh) continue;
 
       for (let i = 0; i < t.numRows; i++) {
-        pt.set(
-          geomArray[i * 3 + 0],
-          geomArray[i * 3 + 1],
-          geomArray[i * 3 + 2] * layerSpacing
-        );
-        
-        // 2. Project 3D Coordinates to 2D Screen Pixels
-        pt.project(rendererWrapper.camera);
-        // pt.x and pt.y are in Normalized Device Coordinates (-1 to 1)
-        const screenX = (pt.x + 1) / 2 * window.innerWidth;
-        const screenY = -(pt.y - 1) / 2 * window.innerHeight;
-        
-        // 3. Screen-Space Hit Detection
         const instanceSize = sizeArray ? sizeArray[i] : 1.0;
-        const screenRadius = (targetPixels * instanceSize) / 2.0;
         
-        const dx = mouseX - screenX;
-        const dy = mouseY - screenY;
-        const distToCenter = Math.sqrt(dx*dx + dy*dy);
-        
-        // Always prioritize the point physically closest to the mouse!
-        // Only use tileZ (Zoom Level) as a tie-breaker if distances are extremely close (< 1 pixel)
-        if (distToCenter <= screenRadius) {
-          if (distToCenter < minDistToCenter - 1.0 || (Math.abs(distToCenter - minDistToCenter) <= 1.0 && tileZ > closestTileZ)) {
-            closestTileKey = t.key;
-            closestRowIndex = i;
-            closestTileZ = tileZ;
-            minDistToCenter = distToCenter;
+        if (is2DMode) {
+          // ULTRA-FAST WORLD SPACE PICKING FOR 2D
+          const px = geomArray[i * 3 + 0];
+          const py = geomArray[i * 3 + 1];
+          
+          const dx = mouseWorld.x - px;
+          const dy = mouseWorld.y - py;
+          const distSq = dx*dx + dy*dy;
+          
+          const worldRadius = worldRadiusBase * instanceSize;
+          
+          if (distSq <= worldRadius * worldRadius) {
+            const dist = Math.sqrt(distSq);
+            if (dist < minDistToCenter - (worldUnitsPerPixel) || (Math.abs(dist - minDistToCenter) <= (worldUnitsPerPixel) && tileZ > closestTileZ)) {
+              closestTileKey = t.key;
+              closestRowIndex = i;
+              closestTileZ = tileZ;
+              minDistToCenter = dist;
+            }
+          }
+        } else {
+          // PERSPECTIVE SCREEN-SPACE PICKING FOR 2.5D
+          pt.set(
+            geomArray[i * 3 + 0],
+            geomArray[i * 3 + 1],
+            geomArray[i * 3 + 2] * layerSpacing
+          );
+          
+          // Project 3D Coordinates to 2D Screen Pixels
+          pt.project(rendererWrapper.camera);
+          const screenX = (pt.x + 1) / 2 * window.innerWidth;
+          const screenY = -(pt.y - 1) / 2 * window.innerHeight;
+          
+          const screenRadius = (targetPixels * instanceSize) / 2.0;
+          
+          const dx = mouseX - screenX;
+          const dy = mouseY - screenY;
+          const distToCenter = Math.sqrt(dx*dx + dy*dy);
+          
+          if (distToCenter <= screenRadius) {
+            if (distToCenter < minDistToCenter - 1.0 || (Math.abs(distToCenter - minDistToCenter) <= 1.0 && tileZ > closestTileZ)) {
+              closestTileKey = t.key;
+              closestRowIndex = i;
+              closestTileZ = tileZ;
+              minDistToCenter = distToCenter;
+            }
           }
         }
       }
@@ -531,18 +559,10 @@ async function init() {
     }
   }
 
-  let isPicking = false;
   window.addEventListener('mousemove', (e) => {
     mouse.x = e.clientX;
     mouse.y = e.clientY;
-    
-    if (!isPicking) {
-      isPicking = true;
-      requestAnimationFrame(() => {
-        performCPUPicking(mouse.x, mouse.y);
-        isPicking = false;
-      });
-    }
+    performCPUPicking(mouse.x, mouse.y);
   });
 
   rendererWrapper.renderer.setAnimationLoop(() => {
