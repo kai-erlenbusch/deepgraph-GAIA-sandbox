@@ -157,7 +157,7 @@ export class Renderer {
     this.zoomUniform.value = this.camera.zoom; 
     this.dprUniform.value = window.devicePixelRatio;
 
-    const currentZoom = Math.log2(0.004 / this.worldUnitsPerPixelUniform.value);
+    const currentZoom = Math.log2(Math.max(1.0, this.camera.zoom));
     this.zoomTUniform.value = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
     
     this.renderer.render(this.scene, this.camera);

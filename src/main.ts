@@ -186,6 +186,11 @@ async function init() {
     }
   });
 
+  // Connect TileManager's Cache Eviction to Scatterplot's GPU slots
+  tileManager.onTileUnloaded = (tileId: string) => {
+      scatterplot.unloadTile(tileId);
+  };
+
   rendererWrapper.renderer.setAnimationLoop(() => {
     try {
       // 1. Get frustum

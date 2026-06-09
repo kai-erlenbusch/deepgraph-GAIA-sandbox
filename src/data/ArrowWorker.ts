@@ -65,7 +65,17 @@ self.onmessage = async (e: MessageEvent) => {
     const yBuffer = getBuffer(yChild);
     
     const ixCol = table.getChild('ix');
-    const ixBuffer = getBuffer(ixCol);
+    let ixBuffer: ArrayBuffer;
+    if (ixCol) {
+        const rawArray = ixCol.toArray();
+        const floatArray = new Float32Array(numRows);
+        for (let i = 0; i < numRows; i++) {
+            floatArray[i] = rawArray[i] == null ? 0 : Number(rawArray[i]);
+        }
+        ixBuffer = floatArray.buffer;
+    } else {
+        ixBuffer = new Float32Array(numRows).buffer;
+    }
     
     self.postMessage(
       { key, stage: 'geom', xBuffer, yBuffer, ixBuffer, numRows, childrenKeys, extent }, 

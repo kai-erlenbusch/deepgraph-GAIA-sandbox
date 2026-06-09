@@ -234,14 +234,20 @@ export class Scatterplot {
     
     // Dynamic Density Culling (Progressive Subsampling)
     const orthoCam = camera as THREE.OrthographicCamera;
+    const visibleWidth = (orthoCam.right - orthoCam.left) / camera.zoom;
     const visibleHeight = (orthoCam.top - orthoCam.bottom) / camera.zoom;
-    const worldUnitsPerPixel = visibleHeight / window.innerHeight;
-    const currentZoom = Math.log2(0.004 / worldUnitsPerPixel);
+    
+    // Scale-invariant zoom calculation
+    const currentZoom = Math.log2(Math.max(1.0, camera.zoom));
     const zoomT = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
     
-    // Exponential scale: Zoomed out reveals 10^5 = 100k points per density block
-    // Zoomed in reveals 10^8.5 = 316M points per density block
-    this.maxIxUniform.value = Math.pow(10, 5.0 + zoomT * 3.5);
+    // Maintain a constant density of roughly 3M points across the visible screen
+    const visibleArea = visibleWidth * visibleHeight;
+    const safeRootArea = this.rootArea > 0 ? this.rootArea : 1;
+    const areaRatio = safeRootArea / visibleArea;
+    
+    const targetPointsOnScreen = 3000000;
+    this.maxIxUniform.value = targetPointsOnScreen * areaRatio;
   }
 
     private getFreeSlot(): number {
@@ -267,43 +273,44 @@ export class Scatterplot {
       return false;
     }
 
-  public updateTiles(tiles: TileData[]) {
-    const currentKeys = new Set(tiles.map(t => t.key));
-    
-    // We remove the contiguous MAX_UPDATE_ROWS limit because disjoint writeBuffer calls 
-    // solve the PCIe over-fetching natively. We can process more tiles per frame safely.
-    const MAX_PROCESS_TILES = 20; 
-    let processedTiles = 0;
-    
-    let minUpdateOffset = Infinity;
-    let maxUpdateOffset = -1;
-    let needsFallbackUpdate = false;
+    private globalZeroBuffer: ArrayBuffer = new Float32Array(this.rowsPerTile).buffer;
 
-    // 1. Process removed tiles
-    for (let i = 0; i < this.maxTiles; i++) {
-        const key = this.slotToTileKey[i];
-        if (key !== '' && !currentKeys.has(key)) {
-            const offset = i * this.rowsPerTile;
-            
-            // Unload slot
-            this.slotToTileKey[i] = '';
+    public unloadTile(key: string) {
+        const slot = this.tileKeyToSlot.get(key);
+        if (slot !== undefined) {
+            this.slotToTileKey[slot] = '';
             this.tileKeyToSlot.delete(key);
             
-            // Setting instanceSize to 0 effectively hides it from culling and rendering
             const sizeAttr = this.globalMesh.geometry.attributes.instanceSize as StorageInstancedBufferAttribute;
-            const zeroBuffer = new Float32Array(this.rowsPerTile).buffer;
+            const offset = slot * this.rowsPerTile;
             
-            const wrote = this.writeToGPUBuffer(sizeAttr, offset * 4, zeroBuffer, 0, zeroBuffer.byteLength);
+            const wrote = this.writeToGPUBuffer(sizeAttr, offset * 4, this.globalZeroBuffer, 0, this.globalZeroBuffer.byteLength);
             if (!wrote) {
                 (sizeAttr.array as Float32Array).fill(0.0, offset, offset + this.rowsPerTile);
-                minUpdateOffset = Math.min(minUpdateOffset, offset);
-                maxUpdateOffset = Math.max(maxUpdateOffset, offset + this.rowsPerTile);
-                needsFallbackUpdate = true;
+                sizeAttr.needsUpdate = true;
             }
         }
     }
 
-    let maxSlotUsed = -1;
+    public updateTiles(tiles: TileData[]) {
+        const currentKeys = new Set(tiles.map(t => t.key));
+        
+        // We remove the contiguous MAX_UPDATE_ROWS limit because disjoint writeBuffer calls 
+        // solve the PCIe over-fetching natively. We can process more tiles per frame safely.
+        const MAX_PROCESS_TILES = 20; 
+        let processedTiles = 0;
+        
+        let minUpdateOffset = Infinity;
+        let maxUpdateOffset = -1;
+        let needsFallbackUpdate = false;
+
+        // Remove the aggressive frame-by-frame GC!
+        // Tiles are only unloaded when `unloadTile` is called by TileManager.
+        
+        let maxSlotUsed = -1;
+        for (let i = 0; i < this.maxTiles; i++) {
+            if (this.slotToTileKey[i] !== '') maxSlotUsed = i;
+        }
 
     // 2. Process added/updated tiles
     for (const tile of tiles) {
@@ -341,9 +348,6 @@ export class Scatterplot {
                 needsFallbackUpdate = true;
                 tileNeedsFallback = true;
             }
-            delete tile.xBuffer;
-            delete tile.yBuffer;
-            delete tile.ixBuffer;
         }
         
         if (tile.colorBuffer) {
@@ -361,13 +365,10 @@ export class Scatterplot {
                 needsFallbackUpdate = true;
                 tileNeedsFallback = true;
             }
-            delete tile.colorBuffer;
-            delete tile.sizeBuffer;
         }
         
         if (tile.hoverBuffer) {
             this.globalHoverBuffer.set(new Int32Array(tile.hoverBuffer), offset * 3);
-            delete tile.hoverBuffer;
         }
 
         if (tileNeedsFallback) {
@@ -424,11 +425,11 @@ export class Scatterplot {
       const y = offsetY[globalId];
       this.hoverMesh.position.set(x, y, 0.0);
       
-      const worldUnitsPerPixel = this.rendererWrapper.worldUnitsPerPixelUniform.value as number;
-      const currentZoom = Math.log2(0.004 / worldUnitsPerPixel);
-      const zoomT = Math.max(0, Math.min(1, Math.max(0, currentZoom) / 6.0));
-      const targetPixels = 1.0 * (1 - zoomT) + 2.0 * zoomT;
-      const baseInstanceSize = 0.8 * (1 - zoomT) + 3.0 * zoomT;
+      // Sync hover scale precisely with the visual shader scale
+      const currentZoom = Math.log2(Math.max(1.0, this.rendererWrapper.camera.zoom));
+      const zoomT = Math.max(0, Math.min(1.0, currentZoom / 6.0));
+      const targetPixels = 1.0 * (1.0 - zoomT) + 2.0 * zoomT;
+      const baseInstanceSize = 0.8 * (1.0 - zoomT) + 3.0 * zoomT;
       const instanceSize = sizeBuffer[globalId];
       
       const physicalSize = targetPixels * baseInstanceSize * instanceSize * worldUnitsPerPixel * 4.0;

@@ -102,6 +102,13 @@ This happens entirely on the GPU silicon, requiring minimal effort from the CPU.
 
 ---
 
+## ✨ Recent Performance Optimizations
+
+1. **Synchronized LRU GPU Offloading:** Initially, the engine aggressively destroyed WebGPU tile buffers on *every single frame* if a tile was no longer in the camera frustum. This caused massive garbage-collection spikes (250+ KB per tile) and stalled the WebGPU command queue when zooming out. The architecture has been re-engineered so the WebGPU backend perfectly mirrors the `TileManager` RAM cache. GPU slots are now retained and only zeroed-out when the LRU cache explicitly evicts a stale tile, resulting in buttery-smooth zoom-outs.
+2. **Native Quadfeather Axis Alignment:** The deepscatter quadtree generator (`quadfeather`) natively encodes its binary chunks using a Y-up axis orientation (South to North). Standard web-slippy maps use a Y-down orientation. The `TileManager` frustum-culling logic has been updated to natively align with `quadfeather` bounding boxes, resolving a critical issue where "Top Half" tiles were fetching "Bottom Half" binary chunks and drawing them off-screen.
+
+---
+
 ## ⚠️ Known Challenges & Current Limitations
 
 This is a stress test sandbox, and several major architectural challenges remain unresolved:

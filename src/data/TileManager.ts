@@ -219,7 +219,7 @@ export class TileManager {
     const queue: TileNode[] = [this.root];
     this.root.error = this.calculateSSE(this.root, camera);
     
-    let totalPointsRendered = 0;
+    // Traverse to determine required Level of Detail based on SSE
 
     // Traverse to determine required Level of Detail based on SSE
     while (queue.length > 0) {
@@ -247,34 +247,32 @@ export class TileManager {
       
       const inFrustum = node.intersects(frustum);
       
+      // Phase 3 Fix: If a node is completely out of the padded frustum, drop it entirely!
+      // This prevents the engine from traversing and downloading millions of off-screen points.
+      if (!inFrustum && node.z !== 0) {
+          continue;
+      }
+      
       desiredTiles.push(node);
 
       // Additive LOD: If we reached this node, we want to render it (if loaded)
       if (node.tileData) {
         node.lastAccessFrame = this.currentFrame;
-        // Only actually render it if it intersects the strict frustum
-        if (inFrustum) {
-          visibleTiles.push(node.tileData);
-          totalPointsRendered += node.tileData.numRows;
-        }
+        visibleTiles.push(node.tileData);
       }
 
-      // Frustum LOD Hysteresis
-      // We lower the threshold to 128 pixels to aggressively load deeper detail
+      // Frustum LOD
       const subdivideThreshold = inFrustum ? 128 : 256;
       let shouldSubdivide = node.error > subdivideThreshold && node.z < 16;
       
-      // THE FIX: Override subdivision if we are over budget!
-      if (totalPointsRendered >= 5000000) { 
-          shouldSubdivide = false; 
+      // Proper Additive LOD Budget
+      // Stop subdividing if we approach our cache limit. We don't 'break' the loop,
+      // so peripheral nodes already in the queue still get popped and rendered, preventing sharp missing holes!
+      if (desiredTiles.length >= this.maxCacheSize - 50) {
+          shouldSubdivide = false;
       }
       
-      // In Additive LOD, we MUST traverse to children if they exist in cache, 
-      // otherwise they get erroneously removed from the GPU!
       let traverseToChildren = shouldSubdivide;
-      if (!traverseToChildren && node.children) {
-          traverseToChildren = node.children.some(c => c.tileData !== null || c.fetchStatus === 'loading');
-      }
       
       if (traverseToChildren && node.fetchStatus === 'done' && node.tileData) {
         if (!node.children) {
@@ -351,12 +349,12 @@ export class TileManager {
 
     if (loadedCount <= this.maxCacheSize) return;
 
-    // To prevent visual holes, evict deepest tiles first (Z descending), then by LRU
+    // Phase 2: Fix Cache Thrashing. Evict by LRU first, then Z as a tie-breaker.
     loadedNodes.sort((a, b) => {
-      if (a.z !== b.z) {
-        return b.z - a.z; // Evict deeper tiles first
+      if (a.lastAccessFrame !== b.lastAccessFrame) {
+        return a.lastAccessFrame - b.lastAccessFrame; // Evict oldest accessed first
       }
-      return a.lastAccessFrame - b.lastAccessFrame; // Evict oldest accessed first
+      return b.z - a.z; // Tie-breaker: evict deeper tiles
     });
     
     const excess = loadedCount - this.maxCacheSize;
@@ -386,13 +384,14 @@ export class TileManager {
     const x = node.x * 2;
     const y = node.y * 2;
 
-    // In this specific GAIA Deepscatter dataset:
-    // Standard web-mapping (Slippy Map) defines Y=0 at the Top.
+    // In Python quadfeather:
+    // j=0 (Even Y, y*2) gets ylim[0] which is [minY, midY] (Bottom Half)
+    // j=1 (Odd Y, y*2+1) gets ylim[1] which is [midY, maxY] (Top Half)
     node.children = [
-      new TileNode(z, x, y + 1, { minX, minY, maxX: midX, maxY: midY }),             // SW (Bottom-Left)
-      new TileNode(z, x + 1, y + 1, { minX: midX, minY, maxX, maxY: midY }),         // SE (Bottom-Right)
-      new TileNode(z, x, y, { minX, minY: midY, maxX: midX, maxY }),                 // NW (Top-Left)
-      new TileNode(z, x + 1, y, { minX: midX, minY: midY, maxX, maxY })              // NE (Top-Right)
+      new TileNode(z, x, y, { minX, minY, maxX: midX, maxY: midY }),                 // SW (Bottom-Left, Even Y)
+      new TileNode(z, x + 1, y, { minX: midX, minY, maxX, maxY: midY }),             // SE (Bottom-Right, Even Y)
+      new TileNode(z, x, y + 1, { minX, minY: midY, maxX: midX, maxY }),             // NW (Top-Left, Odd Y)
+      new TileNode(z, x + 1, y + 1, { minX: midX, minY: midY, maxX, maxY })          // NE (Top-Right, Odd Y)
     ];
     
     // Register in nodeMap for semantic updates
