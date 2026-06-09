@@ -116,5 +116,16 @@ This is a stress test sandbox, and several major architectural challenges remain
 - **HTTP Network Throttling:** The browser caps concurrent requests to a single domain (usually 6). When zooming rapidly, the Quadtree can identify 50+ tiles that need loading, creating a network queue bottleneck that causes the UI to visibly wait for data.
 - **Additive Popping:** When new points finish downloading and render onto the screen, they appear at 100% opacity instantly. The engine currently lacks temporal anti-aliasing or alpha fade-ins to soften this visual popping effect during deep zooms.
 
-## 📄 License
-MIT License
+## 📚 Citing
+
+If you use this software in your work or scientific research, it is important to properly cite it to acknowledge the contribution of the developers. When citing, please include the following metadata:
+
+[Insert Names/Title/Year] [Computer software]. https://github.com/kai-erlenbusch/deepgraph-GAIA-sandbox
+
+This citation should include the names of the developers, the year of publication, the title of the software, and the medium (Computer software). The URL should also be included to provide a direct link to the software.
+
+## 📄 Licensing
+
+This project is freely available for non-commercial use under the **Creative Commons Attribution Non Commercial CC BY-NC 4.0** public license. Please note that this license does not permit commercial use of the software. For more information about the limitations of this license, you can refer to the [CC BY-NC 4.0 License Deed](https://creativecommons.org/licenses/by-nc/4.0/).
+
+If you’re planning to use this software commercially, please reach out to us for a Business license.
