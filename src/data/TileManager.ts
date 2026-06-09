@@ -11,7 +11,7 @@ export interface TileData {
   key: string;
   xBuffer: ArrayBuffer | null;
   yBuffer: ArrayBuffer | null;
-  zBuffer: ArrayBuffer | null;
+  ixBuffer: ArrayBuffer | null;
   colorBuffer: ArrayBuffer | null;
   sizeBuffer: ArrayBuffer | null;
   hoverBuffer: ArrayBuffer | null;
@@ -87,7 +87,7 @@ export class TileManager {
     for (let i = 0; i < numWorkers; i++) {
       const worker = new Worker(new URL('./ArrowWorker.ts', import.meta.url), { type: 'module' });
       worker.onmessage = (e) => {
-        const { key, stage, error, geomBuffer, xBuffer, yBuffer, zBuffer, numRows, colorBuffer, sizeBuffer, hoverBuffer } = e.data;
+        const { key, stage, error, geomBuffer, xBuffer, yBuffer, ixBuffer, numRows, colorBuffer, sizeBuffer, hoverBuffer } = e.data;
         
         if (error) {
           if (error !== '404') console.warn(`Worker error for ${key}:`, error);
@@ -131,7 +131,7 @@ export class TileManager {
               key, 
               xBuffer,
               yBuffer,
-              zBuffer,
+              ixBuffer,
               colorBuffer: null, 
               sizeBuffer: null, 
               hoverBuffer: null, 
@@ -219,7 +219,7 @@ export class TileManager {
     const queue: TileNode[] = [this.root];
     this.root.error = this.calculateSSE(this.root, camera);
     
-    const MAX_VISIBLE_TILES = 200; // Strict budget to prevent 30M point overdraw
+    let totalPointsRendered = 0;
 
     // Traverse to determine required Level of Detail based on SSE
     while (queue.length > 0) {
@@ -249,10 +249,25 @@ export class TileManager {
       
       desiredTiles.push(node);
 
+      // Additive LOD: If we reached this node, we want to render it (if loaded)
+      if (node.tileData) {
+        node.lastAccessFrame = this.currentFrame;
+        // Only actually render it if it intersects the strict frustum
+        if (inFrustum) {
+          visibleTiles.push(node.tileData);
+          totalPointsRendered += node.tileData.numRows;
+        }
+      }
+
       // Frustum LOD Hysteresis
       // We lower the threshold to 128 pixels to aggressively load deeper detail
       const subdivideThreshold = inFrustum ? 128 : 256;
-      const shouldSubdivide = node.error > subdivideThreshold && node.z < 16;
+      let shouldSubdivide = node.error > subdivideThreshold && node.z < 16;
+      
+      // THE FIX: Override subdivision if we are over budget!
+      if (totalPointsRendered >= 5000000) { 
+          shouldSubdivide = false; 
+      }
       
       // In Additive LOD, we MUST traverse to children if they exist in cache, 
       // otherwise they get erroneously removed from the GPU!
@@ -277,18 +292,6 @@ export class TileManager {
         for (const c of validChildren) {
           c.error = this.calculateSSE(c, camera);
           queue.push(c);
-        }
-      }
-
-      // Additive LOD: If we reached this node, we want to render it (if loaded)
-      if (node.tileData) {
-        node.lastAccessFrame = this.currentFrame;
-        // Only actually render it if it intersects the strict frustum
-        if (inFrustum) {
-          visibleTiles.push(node.tileData);
-          if (visibleTiles.length >= MAX_VISIBLE_TILES) {
-             break; // Strict Traversal Budget Reached
-          }
         }
       }
     }

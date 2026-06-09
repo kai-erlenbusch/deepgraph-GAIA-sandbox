@@ -64,12 +64,12 @@ self.onmessage = async (e: MessageEvent) => {
     const yChild = table.getChild('y_umap') || table.getChild('y');
     const yBuffer = getBuffer(yChild);
     
-    const zChild = table.getChild('z_topo') || table.getChild('z');
-    const zBuffer = getBuffer(zChild);
+    const ixCol = table.getChild('ix');
+    const ixBuffer = getBuffer(ixCol);
     
     self.postMessage(
-      { key, stage: 'geom', xBuffer, yBuffer, zBuffer, numRows, childrenKeys, extent }, 
-      { transfer: [xBuffer, yBuffer, zBuffer] }
+      { key, stage: 'geom', xBuffer, yBuffer, ixBuffer, numRows, childrenKeys, extent }, 
+      { transfer: [xBuffer, yBuffer, ixBuffer] }
     );
     
     // --- SEMANTIC EXTRACTION ---
@@ -82,7 +82,6 @@ self.onmessage = async (e: MessageEvent) => {
     const tokensCol = table.getChild('num_of_tokens');
     const tokensArray = tokensCol ? tokensCol.toArray() : null;
 
-    const ixCol = table.getChild('ix');
     const ixArray = ixCol ? ixCol.toArray() : null;
 
     // GAIA specific columns

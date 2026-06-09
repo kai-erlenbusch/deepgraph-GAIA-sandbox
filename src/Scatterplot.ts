@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { MeshBasicNodeMaterial, StorageInstancedBufferAttribute } from 'three/webgpu';
 import { 
   attribute, float, positionLocal, vec3, vec4, vec2, uv, distance, smoothstep,
-  hash, instanceIndex, max, select, uint, mix, clamp, log2, uniform, varying, instancedArray, storage, cameraProjectionMatrix, cameraViewMatrix, atomicAdd, timerGlobal
+  hash, instanceIndex, max, select, uint, mix, clamp, log2, uniform, varying, instancedArray, storage, cameraProjectionMatrix, cameraViewMatrix, atomicAdd, time
 } from 'three/tsl';
 import { Renderer } from './core/Renderer';
 import { BoundingBox, TileData } from './data/TileManager';
@@ -11,7 +11,7 @@ import { isWarmPalette, warmPaletteColors, coolPaletteColors, paletteUniform } f
 export class Scatterplot {
   public scene: THREE.Scene;
   
-  public maxTiles = 2000;
+  public maxTiles = 800;
   public rowsPerTile = 65536;
   public maxGlobalRows = this.maxTiles * this.rowsPerTile;
   
@@ -25,7 +25,7 @@ export class Scatterplot {
   public pickingRenderTarget: THREE.RenderTarget;
   public hoverMesh: THREE.Mesh;
   public hoverColorUniform: any;
-  public layerSpacingUniform = uniform(0.0);
+  public maxIxUniform = uniform(100000000.0);
   public vpMatrixUniform = uniform(new THREE.Matrix4());
   private rootArea: number;
   private rendererWrapper: Renderer;
@@ -68,7 +68,7 @@ export class Scatterplot {
     
     instancedGeometry.setAttribute('offsetX', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
     instancedGeometry.setAttribute('offsetY', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('offsetZ', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
+    instancedGeometry.setAttribute('pointIx', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
     instancedGeometry.setAttribute('instanceColor', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
     instancedGeometry.setAttribute('instanceSize', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
     instancedGeometry.setAttribute('spawnTime', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows).fill(-1000.0), 1));
@@ -91,7 +91,7 @@ export class Scatterplot {
     const sizeBuffer = storage(geo.attributes.instanceSize, 'float', this.maxGlobalRows).toReadOnly();
     const offsetXBuffer = storage(geo.attributes.offsetX, 'float', this.maxGlobalRows).toReadOnly();
     const offsetYBuffer = storage(geo.attributes.offsetY, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetZBuffer = storage(geo.attributes.offsetZ, 'float', this.maxGlobalRows).toReadOnly();
+    const pointIxBuffer = storage(geo.attributes.pointIx, 'float', this.maxGlobalRows).toReadOnly();
     const spawnTimeBuffer = storage(geo.attributes.spawnTime, 'float', this.maxGlobalRows).toReadOnly();
 
     const mat = new MeshBasicNodeMaterial({
@@ -124,7 +124,9 @@ export class Scatterplot {
     const computedSize = max(float(0.05), float(21.0).sub(safeRawMag).div(float(10.0)));
     const instanceSize = mix(float(0.8), float(3.0), zoomT).mul(computedSize);
     
-    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0);
+    const pointIx = pointIxBuffer.element(instanceIndex);
+    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0)
+                      .and(pointIx.lessThanEqual(this.maxIxUniform));
     const safeSize = select(isVisible, targetPixels.mul(this.rendererWrapper.worldUnitsPerPixelUniform).mul(instanceSize), float(0.0));
     
     // GAIA needs extreme low alpha to allow 1.8B points to sum without washing out
@@ -165,7 +167,7 @@ export class Scatterplot {
     
     // Opacity Fade-in
     const spawnTime = spawnTimeBuffer.element(instanceIndex);
-    const age = timerGlobal().sub(spawnTime);
+    const age = time.sub(spawnTime);
     const fadeAlpha = smoothstep(0.0, 0.3, age);
     
     const shouldDiscard = distanceToCenter.greaterThan(0.5).or(isSubPixelOpacity.and(probDiscard));
@@ -174,7 +176,7 @@ export class Scatterplot {
     mat.colorNode = baseColor.rgb.mul(safeAlpha);
     mat.opacityNode = safeAlpha;
     
-    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), offsetZBuffer.element(instanceIndex).mul(this.layerSpacingUniform));
+    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), float(0.0));
     mat.positionNode = select(isVisible, offset3D.add(positionLocal.mul(safeSize)), vec3(1000000.0));
 
     return mat;
@@ -184,7 +186,7 @@ export class Scatterplot {
     const sizeBuffer = storage(geo.attributes.instanceSize, 'float', this.maxGlobalRows).toReadOnly();
     const offsetXBuffer = storage(geo.attributes.offsetX, 'float', this.maxGlobalRows).toReadOnly();
     const offsetYBuffer = storage(geo.attributes.offsetY, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetZBuffer = storage(geo.attributes.offsetZ, 'float', this.maxGlobalRows).toReadOnly();
+    const pointIxBuffer = storage(geo.attributes.pointIx, 'float', this.maxGlobalRows).toReadOnly();
 
     const mat = new MeshBasicNodeMaterial({
       transparent: true,
@@ -207,7 +209,9 @@ export class Scatterplot {
     
     mat.colorNode = vec3(r, g, b);
     
-    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0);
+    const pointIx = pointIxBuffer.element(instanceIndex);
+    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0)
+                      .and(pointIx.lessThanEqual(this.maxIxUniform));
     const distanceToCenter = distance(uv(), vec2(0.5));
     const shouldDiscard = distanceToCenter.greaterThan(0.5).or(isVisible.not());
     mat.opacityNode = select(shouldDiscard, float(0.0), a);
@@ -217,7 +221,7 @@ export class Scatterplot {
     const instanceSize = mix(float(0.8), float(3.0), zoomT).mul(sizeBuffer.element(instanceIndex));
     const safeSize = targetPixels.mul(this.rendererWrapper.worldUnitsPerPixelUniform).mul(instanceSize);
 
-    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), offsetZBuffer.element(instanceIndex).mul(this.layerSpacingUniform));
+    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), float(0.0));
     mat.positionNode = select(isVisible, offset3D.add(positionLocal.mul(safeSize)), vec3(1000000.0));
 
     return mat;
@@ -227,6 +231,17 @@ export class Scatterplot {
     const vp = new THREE.Matrix4();
     vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.vpMatrixUniform.value.copy(vp);
+    
+    // Dynamic Density Culling (Progressive Subsampling)
+    const orthoCam = camera as THREE.OrthographicCamera;
+    const visibleHeight = (orthoCam.top - orthoCam.bottom) / camera.zoom;
+    const worldUnitsPerPixel = visibleHeight / window.innerHeight;
+    const currentZoom = Math.log2(0.004 / worldUnitsPerPixel);
+    const zoomT = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
+    
+    // Exponential scale: Zoomed out reveals 10^5 = 100k points per density block
+    // Zoomed in reveals 10^8.5 = 316M points per density block
+    this.maxIxUniform.value = Math.pow(10, 5.0 + zoomT * 3.5);
   }
 
     private getFreeSlot(): number {
@@ -314,20 +329,21 @@ export class Scatterplot {
         let tileNeedsFallback = false;
         
         if (tile.xBuffer) {
+            const ixBuf = tile.ixBuffer || new Float32Array(this.rowsPerTile).buffer;
             const wroteX = this.writeToGPUBuffer(geo.attributes.offsetX as StorageInstancedBufferAttribute, offset * 4, tile.xBuffer, 0, tile.xBuffer.byteLength);
             if (wroteX) {
                 this.writeToGPUBuffer(geo.attributes.offsetY as StorageInstancedBufferAttribute, offset * 4, tile.yBuffer!, 0, tile.yBuffer!.byteLength);
-                this.writeToGPUBuffer(geo.attributes.offsetZ as StorageInstancedBufferAttribute, offset * 4, tile.zBuffer!, 0, tile.zBuffer!.byteLength);
+                this.writeToGPUBuffer(geo.attributes.pointIx as StorageInstancedBufferAttribute, offset * 4, ixBuf, 0, ixBuf.byteLength);
             } else {
                 (geo.attributes.offsetX as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.xBuffer), offset);
                 (geo.attributes.offsetY as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.yBuffer!), offset);
-                (geo.attributes.offsetZ as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.zBuffer!), offset);
+                (geo.attributes.pointIx as StorageInstancedBufferAttribute).array.set(new Float32Array(ixBuf), offset);
                 needsFallbackUpdate = true;
                 tileNeedsFallback = true;
             }
             delete tile.xBuffer;
             delete tile.yBuffer;
-            delete tile.zBuffer;
+            delete tile.ixBuffer;
         }
         
         if (tile.colorBuffer) {
@@ -368,7 +384,7 @@ export class Scatterplot {
         const updateCount = maxUpdateOffset - minUpdateOffset;
         const range = { offset: minUpdateOffset, count: updateCount };
         
-        const attrs = ['offsetX', 'offsetY', 'offsetZ', 'instanceColor', 'instanceSize', 'spawnTime'];
+        const attrs = ['offsetX', 'offsetY', 'pointIx', 'instanceColor', 'instanceSize', 'spawnTime'];
         for (const attr of attrs) {
             const a = geo.attributes[attr] as StorageInstancedBufferAttribute;
             a.updateRange = range;
@@ -402,16 +418,11 @@ export class Scatterplot {
   
       const offsetX = (this.globalMesh.geometry.attributes.offsetX as StorageInstancedBufferAttribute).array as Float32Array;
       const offsetY = (this.globalMesh.geometry.attributes.offsetY as StorageInstancedBufferAttribute).array as Float32Array;
-      const offsetZ = (this.globalMesh.geometry.attributes.offsetZ as StorageInstancedBufferAttribute).array as Float32Array;
       const sizeBuffer = (this.globalMesh.geometry.attributes.instanceSize as StorageInstancedBufferAttribute).array as Float32Array;
       
       const x = offsetX[globalId];
       const y = offsetY[globalId];
-      const z = offsetZ[globalId];
-      
-      const zDepth = z * (this.layerSpacingUniform.value as number);
-  
-      this.hoverMesh.position.set(x, y, zDepth);
+      this.hoverMesh.position.set(x, y, 0.0);
       
       const worldUnitsPerPixel = this.rendererWrapper.worldUnitsPerPixelUniform.value as number;
       const currentZoom = Math.log2(0.004 / worldUnitsPerPixel);
