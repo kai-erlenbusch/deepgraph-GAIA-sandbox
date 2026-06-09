@@ -113,6 +113,8 @@ This happens entirely on the GPU silicon, requiring minimal effort from the CPU.
 
 This is a stress test sandbox, and several major architectural challenges remain unresolved:
 
+- **LOD Math Sensitivity:** The quadtree traversal is incredibly sensitive to geometric screen-space error logic. Due to the exponential nature of quadtrees ($4^n$), miscalculating the zoom threshold by just one level forces the engine to fetch and render 4x as many tiles. This leads to rapid cache starvation (hitting the 750 tile limit before reaching the edges of the screen) and performance drops.
+- **Additive Blending Blowouts:** Because the system uses true Additive Blending, rendering too many deep LOD tiles in the same screen space causes the brightness to stack and wash out the visual field. Balancing visual fidelity at deep zoom levels without hitting these blowouts remains an active balancing act.
 - **HTTP Network Throttling:** The browser caps concurrent requests to a single domain (usually 6). When zooming rapidly, the Quadtree can identify 50+ tiles that need loading, creating a network queue bottleneck that causes the UI to visibly wait for data.
 - **Additive Popping:** When new points finish downloading and render onto the screen, they appear at 100% opacity instantly. The engine currently lacks temporal anti-aliasing or alpha fade-ins to soften this visual popping effect during deep zooms.
 

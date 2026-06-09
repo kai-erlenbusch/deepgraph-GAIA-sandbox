@@ -1,5 +1,7 @@
 import { tableFromIPC } from 'apache-arrow';
 
+const controllers = new Map<string, AbortController>();
+
 // The categorical palette
 const hexPalette = [0x173F5F, 0x20639B, 0x3CAEA3, 0xF6D55C, 0xED553B];
 const palette = hexPalette.map(h => {
@@ -11,10 +13,22 @@ const palette = hexPalette.map(h => {
 });
 
 self.onmessage = async (e: MessageEvent) => {
-  const { tileUrl, key } = e.data;
+  const { action, tileUrl, key } = e.data;
+  
+  if (action === 'abort') {
+      const controller = controllers.get(key);
+      if (controller) {
+          controller.abort();
+          controllers.delete(key);
+      }
+      return;
+  }
+  
+  const controller = new AbortController();
+  controllers.set(key, controller);
   
   try {
-    const res = await fetch(tileUrl, { cache: 'no-cache' });
+    const res = await fetch(tileUrl, { cache: 'no-cache', signal: controller.signal });
     if (!res.ok) throw new Error((res.status === 404 || res.status === 403) ? '404' : `HTTP ${res.status}`);
     
     const bufferArray = await res.arrayBuffer();
@@ -124,7 +138,13 @@ self.onmessage = async (e: MessageEvent) => {
       { transfer: [colorBuffer, sizeBuffer, hoverBuffer.buffer] }
     );
     
-  } catch (err) {
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      // Silently exit on abort to avoid console spam and error handling loops
+      return;
+    }
     self.postMessage({ key, error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    controllers.delete(key);
   }
 };

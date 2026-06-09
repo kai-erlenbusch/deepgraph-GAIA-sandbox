@@ -6,7 +6,7 @@ import {
 } from 'three/tsl';
 import { Renderer } from './core/Renderer';
 import { BoundingBox, TileData } from './data/TileManager';
-import { isWarmPalette, warmPaletteColors, coolPaletteColors, paletteUniform } from './main';
+
 
 export class Scatterplot {
   public scene: THREE.Scene;
@@ -25,6 +25,7 @@ export class Scatterplot {
   public pickingRenderTarget: THREE.RenderTarget;
   public hoverMesh: THREE.Mesh;
   public hoverColorUniform: any;
+  public layerSpacingUniform = uniform(0.0);
   public maxIxUniform = uniform(100000000.0);
   public vpMatrixUniform = uniform(new THREE.Matrix4());
   private rootArea: number;
@@ -57,7 +58,10 @@ export class Scatterplot {
     this.pickingRenderTarget = new THREE.RenderTarget(1, 1, {
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
-      depthBuffer: true
+      depthBuffer: true,
+      colorSpace: THREE.NoColorSpace,
+      magFilter: THREE.NearestFilter,
+      minFilter: THREE.NearestFilter
     });
 
     // 1. Pre-allocate exactly one global mesh to handle up to 800 tiles (52 million points)
@@ -173,7 +177,7 @@ export class Scatterplot {
     const shouldDiscard = distanceToCenter.greaterThan(0.5).or(isSubPixelOpacity.and(probDiscard));
     const safeAlpha = select(shouldDiscard, float(0.0), max(finalAlpha, threshold).mul(fadeAlpha));
 
-    mat.colorNode = baseColor.rgb.mul(safeAlpha);
+    mat.colorNode = baseColor.mul(safeAlpha);
     mat.opacityNode = safeAlpha;
     
     const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), float(0.0));
@@ -304,12 +308,16 @@ export class Scatterplot {
         let maxUpdateOffset = -1;
         let needsFallbackUpdate = false;
 
-        // Remove the aggressive frame-by-frame GC!
-        // Tiles are only unloaded when `unloadTile` is called by TileManager.
-        
         let maxSlotUsed = -1;
         for (let i = 0; i < this.maxTiles; i++) {
             if (this.slotToTileKey[i] !== '') maxSlotUsed = i;
+        }
+
+        // 1. Identify tiles that are currently on GPU but no longer active
+        for (const [key, slot] of this.tileKeyToSlot.entries()) {
+            if (!currentKeys.has(key)) {
+                this.unloadTile(key);
+            }
         }
 
     // 2. Process added/updated tiles

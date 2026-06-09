@@ -11,30 +11,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Stats from 'three/examples/jsm/libs/stats.module.js';
 const TILE_SERVER_URL = 'https://files.benschmidt.org/tiles/gaia';
 
-// --- Shader-Side Color Palettes ---
-export const warmPaletteColors = ['#ffeda0', '#feb24c', '#f03b20', '#bcbddc', '#756bb1'];
-export const coolPaletteColors = ['#f1eef6', '#bdc9e1', '#74a9cf', '#2b8cbe', '#045a8d'];
 
-export let isWarmPalette = true;
-
-// Create a dedicated array of THREE.Color objects for the uniform
-export const activePalette = warmPaletteColors.map(c => new THREE.Color(c));
-
-// We define the uniform array node so TSL can mathematically index into it
-export const paletteUniform = uniformArray(activePalette);
-
-(window as any).swapPalette = () => {
-  isWarmPalette = !isWarmPalette;
-  const newColors = isWarmPalette ? warmPaletteColors : coolPaletteColors;
-  // Update the underlying THREE.Color objects inside the uniform node
-  for (let i = 0; i < 5; i++) {
-    (paletteUniform.array as THREE.Color[])[i].set(newColors[i]);
-  }
-  const btn = document.getElementById('swap-palette-btn');
-  if (btn) {
-    btn.innerText = `Swap Palette (${isWarmPalette ? 'Warm' : 'Cool'})`;
-  }
-};
 
 import { Scatterplot } from './Scatterplot';
 import { Renderer } from './core/Renderer';

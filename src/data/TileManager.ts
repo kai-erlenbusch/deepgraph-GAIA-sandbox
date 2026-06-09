@@ -28,7 +28,8 @@ export class TileNode {
   bounds: BoundingBox;
   box3: THREE.Box3;
   tileData: TileData | null = null;
-  fetchStatus: 'idle' | 'loading' | 'done' | 'error' = 'idle';
+  fetchStatus: 'idle' | 'loading' | 'done' | 'error' | 'unloaded' = 'idle';
+  fetchErrorReason?: string;
   lastAccessFrame: number = 0;
   children: TileNode[] | null = null;
   key: string;
@@ -69,10 +70,12 @@ export class TileManager {
   private pendingRequests: Map<string, (data: TileData | null) => void> = new Map();
   public nodeMap: Map<string, TileNode> = new Map();
   private workers: Worker[] = [];
+  private tileToWorker: Map<string, Worker> = new Map();
   private nextWorkerIndex = 0;
 
   private currentFrame = 0;
   public maxCacheSize = 800; // Match GPU capacity to prevent cache thrashing
+  public onTileUnloaded?: (tileId: string) => void;
   private validTiles: Set<string>;
   private cacheBuster: number = Date.now();
 
@@ -88,12 +91,19 @@ export class TileManager {
       const worker = new Worker(new URL('./ArrowWorker.ts', import.meta.url), { type: 'module' });
       worker.onmessage = (e) => {
         const { key, stage, error, geomBuffer, xBuffer, yBuffer, ixBuffer, numRows, colorBuffer, sizeBuffer, hoverBuffer } = e.data;
-        
         if (error) {
-          if (error !== '404') console.warn(`Worker error for ${key}:`, error);
+          if (error !== 'AbortError') console.warn(`Worker error for ${key}:`, error);
+          
+          const node = this.nodeMap.get(key);
+          if (node) {
+              node.fetchStatus = 'error';
+              node.fetchErrorReason = error;
+          }
+          
           const resolve = this.pendingRequests.get(key);
           if (resolve) resolve(null);
           this.pendingRequests.delete(key);
+          this.tileToWorker.delete(key);
           return;
         }
         
@@ -140,6 +150,7 @@ export class TileManager {
               needsUpdate: false 
             });
             this.pendingRequests.delete(key);
+            this.tileToWorker.delete(key); // Cleanup
           }
         } else if (stage === 'semantic') {
           const node = this.nodeMap.get(key);
@@ -177,6 +188,9 @@ export class TileManager {
       // Round-robin dispatch
       const worker = this.workers[this.nextWorkerIndex];
       this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
+      
+      this.tileToWorker.set(key, worker);
+      
       const tileUrl = this.getTileUrl(node.z, node.x, node.y);
       worker.postMessage({ tileUrl, key });
     }).then(data => {
@@ -196,7 +210,6 @@ export class TileManager {
     return promise;
   }
 
-  // Calculate mathematically correct Screen-Space Error based on the orthographic camera's zoom
   private calculateSSE(node: TileNode, camera: THREE.OrthographicCamera): number {
     const visibleHeight = (camera.top - camera.bottom) / camera.zoom;
     const nodeSize = node.bounds.maxX - node.bounds.minX;
@@ -230,7 +243,7 @@ export class TileManager {
       queue.sort((a, b) => {
         // Primary Sort: node.error (guarantees lower Z levels are processed first)
         const errorDiff = b.error - a.error;
-        if (Math.abs(errorDiff) > 1.0) {
+        if (Math.abs(errorDiff) > 50.0) {
             return errorDiff;
         }
         
@@ -294,10 +307,6 @@ export class TileManager {
       }
     }
 
-    // We no longer need to sort desiredTiles here because the traversal queue 
-    // naturally added them in priority order, so desiredTiles is already somewhat 
-    // prioritized. But we can keep the fetches focused on the front of desiredTiles.
-    
     // Sort desiredTiles to ensure fetching prioritizes the best tiles
     const cx = camera.position.x;
     const cy = camera.position.y;
@@ -318,15 +327,51 @@ export class TileManager {
     const MAX_NEW_FETCHES_PER_FRAME = 20;
     let newFetchesThisFrame = 0;
 
-    // Issue fetches based on Priority Queue
-    for (const node of desiredTiles) {
-      if (newFetchesThisFrame >= MAX_NEW_FETCHES_PER_FRAME) break;
-
-      if (!node.tileData && !this.fetchCache.has(node.key)) {
-        this.loadTile(node);
-        newFetchesThisFrame++;
+    // Aggressive Network Cleanup: Abort loading tiles that fell out of the desired frustum
+    const desiredKeys = new Set(desiredTiles.map(n => n.key));
+    
+    for (const [key, promise] of this.fetchCache.entries()) {
+      const node = this.nodeMap.get(key);
+      if (node && node.fetchStatus === 'loading' && !desiredKeys.has(key)) {
+        // Tile is loading but no longer in the expanded frustum! Abort it!
+        const worker = this.tileToWorker.get(key);
+        if (worker) {
+            worker.postMessage({ action: 'abort', key });
+            this.tileToWorker.delete(key);
+        }
+        
+        // Resolve the promise to prevent memory leaks in the main thread
+        const resolve = this.pendingRequests.get(key);
+        if (resolve) resolve(null);
+        this.pendingRequests.delete(key);
+        
+        this.fetchCache.delete(key);
+            node.fetchStatus = 'idle';
+        console.log(`Aborted stale fetch for ${key}`);
       }
     }
+
+    // Throttle new fetches to avoid network saturation (Browser max is usually 6 per domain)
+    // We limit total concurrent fetches across all workers to 12.
+    const MAX_CONCURRENT_FETCHES = 12;
+    
+    for (const node of desiredTiles) {
+      if (this.pendingRequests.size >= MAX_CONCURRENT_FETCHES) {
+          break; // Stop issuing new fetches until some finish!
+      }
+      
+      // If it previously failed due to a network timeout, we CAN retry it, 
+      // but only if it's currently highly desired (in frustum).
+      // We NEVER retry 404s, because those files mathematically do not exist.
+      if (node.fetchStatus === 'error' && node.fetchErrorReason !== '404') {
+          node.fetchStatus = 'idle';
+          this.fetchCache.delete(node.key);
+      }
+      
+      if (!node.tileData && !this.fetchCache.has(node.key)) {
+        this.loadTile(node);
+      }
+    } 
 
     this.activeTiles = visibleTiles;
     this.evictStaleTiles();
@@ -367,9 +412,19 @@ export class TileManager {
       // Never evict shallow background layers
       if (node.z < 2) continue;
       
+      // If a node was marked as a 404 error, we don't need to evict its data (it has none),
+      // but we do want to keep it in the fetchCache to prevent re-fetching.
+      // So only evict successfully loaded tiles.
+      if (node.fetchStatus === 'error') continue;
+
       this.fetchCache.delete(node.key);
       node.tileData = null; // Drop reference so garbage collector can clean up
       node.fetchStatus = 'idle'; // Reset status so it can be fetched again
+      
+      if (this.onTileUnloaded) {
+          this.onTileUnloaded(node.key);
+      }
+      
       evicted++;
       console.log(`Evicted tile ${node.key} (Z=${node.z}) from Cache`);
     }
