@@ -11,104 +11,108 @@ const palette = hexPalette.map(h => {
 });
 
 self.onmessage = async (e: MessageEvent) => {
-  const { geomUrl, semanticUrl, key } = e.data;
+  const { tileUrl, key } = e.data;
   
   try {
-    // --- 1. FETCH GEOMETRY ---
-    const geomRes = await fetch(geomUrl, { cache: 'no-cache' });
-    if (!geomRes.ok) throw new Error(geomRes.status === 404 ? '404' : `HTTP ${geomRes.status}`);
+    const res = await fetch(tileUrl, { cache: 'no-cache' });
+    if (!res.ok) throw new Error((res.status === 404 || res.status === 403) ? '404' : `HTTP ${res.status}`);
     
-    const geomBufferArray = await geomRes.arrayBuffer();
+    const bufferArray = await res.arrayBuffer();
     
     // Check if Vite SPA returned an HTML file instead of IPC data
-    const headerCheck = new Uint8Array(geomBufferArray, 0, Math.min(15, geomBufferArray.byteLength));
+    const headerCheck = new Uint8Array(bufferArray, 0, Math.min(15, bufferArray.byteLength));
     const headerStr = String.fromCharCode.apply(null, Array.from(headerCheck));
     if (headerStr.includes('<html') || headerStr.includes('<!doc')) {
       throw new Error('404');
     }
     
-    const geomTable = tableFromIPC(geomBufferArray);
-    const numRows = geomTable.numRows;
+    const table = tableFromIPC(bufferArray);
+    const numRows = table.numRows;
     
-    const xChild = geomTable.getChild('x_umap') || geomTable.getChild('x');
-    const xCol = xChild ? xChild.toArray() : new Float32Array(numRows);
-    
-    const yChild = geomTable.getChild('y_umap') || geomTable.getChild('y');
-    const yCol = yChild ? yChild.toArray() : new Float32Array(numRows);
-    
-    const zChild = geomTable.getChild('z_topo') || geomTable.getChild('z');
-    const zCol = zChild ? zChild.toArray() : null;
-    
-    const geomBuffer = new Float32Array(numRows * 3);
-    for (let i = 0; i < numRows; i++) {
-      geomBuffer[i * 3 + 0] = xCol[i];
-      geomBuffer[i * 3 + 1] = yCol[i];
-      geomBuffer[i * 3 + 2] = zCol ? zCol[i] : 0.0;
-    }
-    
-    self.postMessage(
-      { key, stage: 'geom', geomBuffer: geomBuffer.buffer, numRows }, 
-      { transfer: [geomBuffer.buffer] }
-    );
-    
-    // --- 2. FETCH SEMANTICS ---
-    let semTable: any = null;
-    if (geomUrl === semanticUrl) {
-      semTable = geomTable;
-    } else {
-      const semRes = await fetch(semanticUrl, { cache: 'no-cache' });
-      if (semRes.ok) {
-        const semBufferArray = await semRes.arrayBuffer();
-        const semHeaderCheck = new Uint8Array(semBufferArray, 0, Math.min(15, semBufferArray.byteLength));
-        const semHeaderStr = String.fromCharCode.apply(null, Array.from(semHeaderCheck));
-        if (!semHeaderStr.includes('<html') && !semHeaderStr.includes('<!doc')) {
-            semTable = tableFromIPC(semBufferArray);
-        }
+    // --- METADATA EXTRACTION ---
+    let childrenKeys: string[] | null = null;
+    let extent: any = null;
+    if (table.schema.metadata) {
+      const childrenStr = table.schema.metadata.get('children');
+      if (childrenStr) {
+        try {
+          childrenKeys = JSON.parse(childrenStr);
+        } catch(e) {}
+      }
+      const extentStr = table.schema.metadata.get('extent');
+      if (extentStr) {
+        try {
+          extent = JSON.parse(extentStr);
+        } catch(e) {}
       }
     }
     
-    const colorBuffer = new Uint8Array(numRows * 4);
-    const sizeBuffer = new Float32Array(numRows);
-    const hoverBuffer = new Int32Array(numRows * 3);
+    // --- GEOMETRY EXTRACTION (ZERO-EXTRACTION PIPELINE) ---
+    // Instead of mapping the IPC buffer into new Javascript Float32Arrays,
+    // we extract the raw underlying memory buffers.
     
-    if (semTable) {
-        const globalIdCol = semTable.getChild('global_id') || semTable.getChild('__index_level_0__');
-        const globalIds = globalIdCol ? globalIdCol.toArray() : null;
-        
-        const modelIdCol = semTable.getChild('model_id') || semTable.getChild('model');
-        const modelIds = modelIdCol ? modelIdCol.toArray() : null;
-        
-        const tokensCol = semTable.getChild('num_of_tokens');
-        const tokensArray = tokensCol ? tokensCol.toArray() : null;
+    const getBuffer = (child: any) => {
+        if (!child || child.data.length === 0) return new Float32Array(numRows).buffer;
+        const values = child.data[0].values; // This is a Uint8Array or Float32Array view of the raw IPC buffer
+        // Slice creates a very fast transferrable copy of the exact chunk without JS iteration overhead
+        return values.buffer.slice(values.byteOffset, values.byteOffset + values.byteLength);
+    };
 
+    const xChild = table.getChild('x_umap') || table.getChild('x');
+    const xBuffer = getBuffer(xChild);
+    
+    const yChild = table.getChild('y_umap') || table.getChild('y');
+    const yBuffer = getBuffer(yChild);
+    
+    const zChild = table.getChild('z_topo') || table.getChild('z');
+    const zBuffer = getBuffer(zChild);
+    
+    self.postMessage(
+      { key, stage: 'geom', xBuffer, yBuffer, zBuffer, numRows, childrenKeys, extent }, 
+      { transfer: [xBuffer, yBuffer, zBuffer] }
+    );
+    
+    // --- SEMANTIC EXTRACTION ---
+    const globalIdCol = table.getChild('global_id') || table.getChild('__index_level_0__');
+    const globalIds = globalIdCol ? globalIdCol.toArray() : null;
+    
+    const modelIdCol = table.getChild('model_id') || table.getChild('model');
+    const modelIds = modelIdCol ? modelIdCol.toArray() : null;
+    
+    const tokensCol = table.getChild('num_of_tokens');
+    const tokensArray = tokensCol ? tokensCol.toArray() : null;
+
+    const ixCol = table.getChild('ix');
+    const ixArray = ixCol ? ixCol.toArray() : null;
+
+    // GAIA specific columns
+    const bpRpCol = table.getChild('bp_rp');
+    const colorBuffer = getBuffer(bpRpCol);
+    
+    const magCol = table.getChild('phot_g_mean_mag');
+    let sizeBuffer: ArrayBuffer;
+    if (magCol) {
+        sizeBuffer = getBuffer(magCol);
+    } else if (tokensArray) {
+        const floatSizes = new Float32Array(numRows);
         for (let i = 0; i < numRows; i++) {
-          let id = modelIds ? Number(modelIds[i]) % 5 : 0;
-          const c = palette[id];
-          colorBuffer[i * 4 + 0] = c[0];
-          colorBuffer[i * 4 + 1] = c[1];
-          colorBuffer[i * 4 + 2] = c[2];
-          colorBuffer[i * 4 + 3] = 255;
-          
-          const tokens = tokensArray ? Number(tokensArray[i]) : 10;
-          sizeBuffer[i] = Math.max(0.5, Math.log10(Math.max(tokens, 1)));
-          
-          hoverBuffer[i * 3 + 0] = globalIds ? Number(globalIds[i]) : i;
-          hoverBuffer[i * 3 + 1] = modelIds ? Number(modelIds[i]) : 0;
-          hoverBuffer[i * 3 + 2] = tokens;
+            floatSizes[i] = Math.max(0.5, Math.log10(Math.max(Number(tokensArray[i]), 1)));
         }
+        sizeBuffer = floatSizes.buffer;
     } else {
-        for (let i = 0; i < numRows; i++) {
-            colorBuffer[i * 4 + 0] = 128;
-            colorBuffer[i * 4 + 1] = 128;
-            colorBuffer[i * 4 + 2] = 128;
-            colorBuffer[i * 4 + 3] = 255;
-            sizeBuffer[i] = 1.0;
-        }
+        sizeBuffer = new Float32Array(numRows).fill(20.0).buffer;
+    }
+    
+    const hoverBuffer = new Int32Array(numRows * 3);
+    for (let i = 0; i < numRows; i++) {
+      hoverBuffer[i * 3 + 0] = globalIds ? Number(globalIds[i]) : i;
+      hoverBuffer[i * 3 + 1] = modelIds ? Number(modelIds[i]) : 0;
+      hoverBuffer[i * 3 + 2] = ixArray ? Number(ixArray[i]) : (tokensArray ? Number(tokensArray[i]) : 10);
     }
     
     self.postMessage(
-      { key, stage: 'semantic', colorBuffer: colorBuffer.buffer, sizeBuffer: sizeBuffer.buffer, hoverBuffer: hoverBuffer.buffer }, 
-      { transfer: [colorBuffer.buffer, sizeBuffer.buffer, hoverBuffer.buffer] }
+      { key, stage: 'semantic', colorBuffer: colorBuffer, sizeBuffer: sizeBuffer, hoverBuffer: hoverBuffer.buffer }, 
+      { transfer: [colorBuffer, sizeBuffer, hoverBuffer.buffer] }
     );
     
   } catch (err) {

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+public/tiles/
+dist/tiles/
+dist/mock_tiles2/
+dist/data/
+*.png
+.env
+.DS_Store
