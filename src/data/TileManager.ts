@@ -9,16 +9,18 @@ export interface BoundingBox {
 
 export interface TileData {
   key: string;
-  xBuffer: ArrayBuffer | null;
-  yBuffer: ArrayBuffer | null;
-  ixBuffer: ArrayBuffer | null;
-  colorBuffer: ArrayBuffer | null;
-  sizeBuffer: ArrayBuffer | null;
-  hoverBuffer: ArrayBuffer | null;
   numRows: number;
+  bounds: BoundingBox;
+  xBuffer?: ArrayBuffer;
+  yBuffer?: ArrayBuffer;
+  ixBuffer?: ArrayBuffer;
+  colorBuffer?: ArrayBuffer;
+  sizeBuffer?: ArrayBuffer;
+  hoverBuffer?: ArrayBuffer;
   semanticReady: boolean;
   needsUpdate: boolean;
-  bounds?: BoundingBox;
+  minIx?: number;
+  maxIx?: number;
 }
 
 export class TileNode {
@@ -69,6 +71,7 @@ export class TileManager {
   private fetchCache: Map<string, Promise<TileData | null>> = new Map();
   private pendingRequests: Map<string, (data: TileData | null) => void> = new Map();
   public nodeMap: Map<string, TileNode> = new Map();
+  public lruCache: Map<string, TileNode> = new Map(); // O(1) LRU Cache
   private workers: Worker[] = [];
   private tileToWorker: Map<string, Worker> = new Map();
   private nextWorkerIndex = 0;
@@ -90,7 +93,7 @@ export class TileManager {
     for (let i = 0; i < numWorkers; i++) {
       const worker = new Worker(new URL('./ArrowWorker.ts', import.meta.url), { type: 'module' });
       worker.onmessage = (e) => {
-        const { key, stage, error, geomBuffer, xBuffer, yBuffer, ixBuffer, numRows, colorBuffer, sizeBuffer, hoverBuffer } = e.data;
+        const { key, stage, error, geomBuffer, xBuffer, yBuffer, ixBuffer, numRows, colorBuffer, sizeBuffer, hoverBuffer, minIx, maxIx } = e.data;
         if (error) {
           if (error !== 'AbortError') console.warn(`Worker error for ${key}:`, error);
           
@@ -147,7 +150,9 @@ export class TileManager {
               hoverBuffer: null, 
               numRows, 
               semanticReady: false,
-              needsUpdate: false 
+              needsUpdate: false,
+              minIx,
+              maxIx
             });
             this.pendingRequests.delete(key);
             this.tileToWorker.delete(key); // Cleanup
@@ -200,6 +205,8 @@ export class TileManager {
       node.tileData = data;
       node.fetchStatus = 'done'; // Even if null (empty), it's done fetching
       if (data) {
+        this.lruCache.delete(key);
+        this.lruCache.set(key, node); // Add to LRU cache on load
         console.log(`Loaded tile ${key} with ${data.numRows} rows.`);
       }
       return data;
@@ -220,7 +227,7 @@ export class TileManager {
 
   // Traverse the quadtree and collect tiles that should be rendered
   // Returns an array of TileData
-  public getVisibleTiles(frustum: THREE.Frustum, camera: THREE.OrthographicCamera): TileData[] {
+  public getVisibleTiles(frustum: THREE.Frustum, camera: THREE.OrthographicCamera, currentMaxIx: number): TileData[] {
     this.currentFrame++;
     
     if (!this.root) return [];
@@ -229,82 +236,100 @@ export class TileManager {
     const desiredTiles: TileNode[] = [];
     
     // Traversal queue
-    const queue: TileNode[] = [this.root];
+    let currentQueue: TileNode[] = [this.root];
     this.root.error = this.calculateSSE(this.root, camera);
     
-    // Traverse to determine required Level of Detail based on SSE
-
-    // Traverse to determine required Level of Detail based on SSE
-    while (queue.length > 0) {
-      // Sort queue to ensure we process the most important tiles first
+    // Traverse using Two-Queue method
+    while (currentQueue.length > 0) {
       const cx = camera.position.x;
       const cy = camera.position.y;
       
-      queue.sort((a, b) => {
-        // Primary Sort: node.error (guarantees lower Z levels are processed first)
-        const errorDiff = b.error - a.error;
-        if (Math.abs(errorDiff) > 50.0) {
-            return errorDiff;
+      const nextQueue: TileNode[] = [];
+      
+      for (const node of currentQueue) {
+        const inFrustum = node.intersects(frustum);
+        
+        // Phase 3 Fix: If a node is completely out of the padded frustum, drop it entirely!
+        if (!inFrustum && node.z !== 0) {
+            continue;
         }
         
-        // Tie-Breaker: Foveated distance (tiles closer to screen center get processed first)
+        // --- ZERO-COST CPU CULLING ---
+        if (node.tileData && node.tileData.minIx !== undefined && node.tileData.minIx > currentMaxIx) {
+            continue; 
+        }
+        
+        desiredTiles.push(node);
+
+        // Additive LOD: If we reached this node, we want to render it (if loaded)
+        if (node.tileData) {
+          node.lastAccessFrame = this.currentFrame;
+          visibleTiles.push(node.tileData);
+          
+          // Update LRU Cache
+          this.lruCache.delete(node.key);
+          this.lruCache.set(node.key, node);
+        }
+
+        // Dynamic threshold based on cache pressure
+        // If we are getting close to maxCacheSize, we relax the threshold (increase it) to stop subdividing
+        const cachePressure = desiredTiles.length / this.maxCacheSize;
+        const dynamicMultiplier = 1.0 + Math.max(0, cachePressure - 0.5) * 4.0; // If >50% full, increase threshold up to 3x
+        
+        const baseThreshold = inFrustum ? 128 : 256;
+        let subdivideThreshold = baseThreshold * dynamicMultiplier;
+        
+        // Hysteresis: Check if it was already subdivided recently by seeing if children have fetchStatus 'done'
+        const hasLoadedChildren = node.children && node.children.some(c => c.fetchStatus === 'done');
+        if (hasLoadedChildren) {
+            subdivideThreshold *= 0.8; // 20% easier to KEEP subdivided
+        } else {
+            subdivideThreshold *= 1.2; // 20% harder to INITIALLY subdivide
+        }
+
+        let shouldSubdivide = node.error > subdivideThreshold && node.z < 16;
+        
+        if (shouldSubdivide && node.fetchStatus === 'done' && node.tileData) {
+          if (!node.children) {
+            this.createChildren(node);
+          }
+          
+          let validChildren = node.children!;
+          if (node.validChildrenKeys) {
+              validChildren = node.children!.filter(c => node.validChildrenKeys!.has(c.key));
+          } else if (this.validTiles.size > 0) {
+              validChildren = node.children!.filter(c => this.validTiles.has(c.key));
+          }
+          
+          for (const c of validChildren) {
+            c.error = this.calculateSSE(c, camera);
+            nextQueue.push(c);
+          }
+        }
+      }
+      
+      // --- BFS COMPLETE-LEVEL HARDCAP ---
+      // We must only cull AT THE END of a Z-level to prevent sharp tiling artifacts!
+      // If we have rendered enough tiles to saturate the GPU (~50), we completely stop
+      // traversing into deeper Z-levels. By stopping at a level boundary, density remains uniform.
+      if (visibleTiles.length >= 50) {
+          break;
+      }
+      
+      // Sort nextLevelQueue ONCE per depth level
+      nextQueue.sort((a, b) => {
+        const errorDiff = b.error - a.error;
+        if (Math.abs(errorDiff) > 50.0) return errorDiff;
+        
         const getDist = (node: TileNode) => {
             const centerX = (node.bounds.minX + node.bounds.maxX) / 2;
             const centerY = (node.bounds.minY + node.bounds.maxY) / 2;
             return Math.hypot(centerX - cx, centerY - cy);
         };
-        return getDist(a) - getDist(b); // smaller distance = closer = process first
+        return getDist(a) - getDist(b);
       });
-
-      const node = queue.shift()!;
       
-      const inFrustum = node.intersects(frustum);
-      
-      // Phase 3 Fix: If a node is completely out of the padded frustum, drop it entirely!
-      // This prevents the engine from traversing and downloading millions of off-screen points.
-      if (!inFrustum && node.z !== 0) {
-          continue;
-      }
-      
-      desiredTiles.push(node);
-
-      // Additive LOD: If we reached this node, we want to render it (if loaded)
-      if (node.tileData) {
-        node.lastAccessFrame = this.currentFrame;
-        visibleTiles.push(node.tileData);
-      }
-
-      // Frustum LOD
-      const subdivideThreshold = inFrustum ? 128 : 256;
-      let shouldSubdivide = node.error > subdivideThreshold && node.z < 16;
-      
-      // Proper Additive LOD Budget
-      // Stop subdividing if we approach our cache limit. We don't 'break' the loop,
-      // so peripheral nodes already in the queue still get popped and rendered, preventing sharp missing holes!
-      if (desiredTiles.length >= this.maxCacheSize - 50) {
-          shouldSubdivide = false;
-      }
-      
-      let traverseToChildren = shouldSubdivide;
-      
-      if (traverseToChildren && node.fetchStatus === 'done' && node.tileData) {
-        if (!node.children) {
-          this.createChildren(node);
-        }
-        
-        let validChildren = node.children!;
-        if (node.validChildrenKeys) {
-            validChildren = node.children!.filter(c => node.validChildrenKeys!.has(c.key));
-        } else if (this.validTiles.size > 0) {
-            validChildren = node.children!.filter(c => this.validTiles.has(c.key));
-        }
-        
-        // We evaluate all children, but they will be tested against the frustum in their own queue pop
-        for (const c of validChildren) {
-          c.error = this.calculateSSE(c, camera);
-          queue.push(c);
-        }
-      }
+      currentQueue = nextQueue;
     }
 
     // Sort desiredTiles to ensure fetching prioritizes the best tiles
@@ -352,8 +377,8 @@ export class TileManager {
     }
 
     // Throttle new fetches to avoid network saturation (Browser max is usually 6 per domain)
-    // We limit total concurrent fetches across all workers to 12.
-    const MAX_CONCURRENT_FETCHES = 12;
+    // We limit total concurrent fetches across all workers to 6.
+    const MAX_CONCURRENT_FETCHES = 6;
     
     for (const node of desiredTiles) {
       if (this.pendingRequests.size >= MAX_CONCURRENT_FETCHES) {
@@ -379,33 +404,13 @@ export class TileManager {
   }
 
   private evictStaleTiles() {
-    let loadedCount = 0;
-    const loadedNodes: TileNode[] = [];
-    
-    const traverse = (n: TileNode) => {
-      if (n.tileData) {
-        loadedCount++;
-        loadedNodes.push(n);
-      }
-      if (n.children) n.children.forEach(traverse);
-    };
-    
-    if (this.root) traverse(this.root);
+    // Phase 2: O(1) LRU Cache Eviction!
+    if (this.lruCache.size <= this.maxCacheSize) return;
 
-    if (loadedCount <= this.maxCacheSize) return;
-
-    // Phase 2: Fix Cache Thrashing. Evict by LRU first, then Z as a tie-breaker.
-    loadedNodes.sort((a, b) => {
-      if (a.lastAccessFrame !== b.lastAccessFrame) {
-        return a.lastAccessFrame - b.lastAccessFrame; // Evict oldest accessed first
-      }
-      return b.z - a.z; // Tie-breaker: evict deeper tiles
-    });
-    
-    const excess = loadedCount - this.maxCacheSize;
+    const excess = this.lruCache.size - this.maxCacheSize;
     let evicted = 0;
     
-    for (const node of loadedNodes) {
+    for (const [key, node] of this.lruCache.entries()) {
       if (evicted >= excess) break;
       // Never evict tiles that were accessed THIS frame (Ancestry Protection)
       if (node.lastAccessFrame === this.currentFrame) continue;
@@ -413,8 +418,6 @@ export class TileManager {
       if (node.z < 2) continue;
       
       // If a node was marked as a 404 error, we don't need to evict its data (it has none),
-      // but we do want to keep it in the fetchCache to prevent re-fetching.
-      // So only evict successfully loaded tiles.
       if (node.fetchStatus === 'error') continue;
 
       this.fetchCache.delete(node.key);
@@ -425,6 +428,7 @@ export class TileManager {
           this.onTileUnloaded(node.key);
       }
       
+      this.lruCache.delete(key);
       evicted++;
       console.log(`Evicted tile ${node.key} (Z=${node.z}) from Cache`);
     }
@@ -439,14 +443,13 @@ export class TileManager {
     const x = node.x * 2;
     const y = node.y * 2;
 
-    // In Python quadfeather:
-    // j=0 (Even Y, y*2) gets ylim[0] which is [minY, midY] (Bottom Half)
-    // j=1 (Odd Y, y*2+1) gets ylim[1] which is [midY, maxY] (Top Half)
+    // quadfeather uses standard spatial indexing where y=0 maps to the first half of the domain [minY, midY].
+    // Since WebGL Y goes up, [minY, midY] is the Bottom Half.
     node.children = [
-      new TileNode(z, x, y, { minX, minY, maxX: midX, maxY: midY }),                 // SW (Bottom-Left, Even Y)
-      new TileNode(z, x + 1, y, { minX: midX, minY, maxX, maxY: midY }),             // SE (Bottom-Right, Even Y)
-      new TileNode(z, x, y + 1, { minX, minY: midY, maxX: midX, maxY }),             // NW (Top-Left, Odd Y)
-      new TileNode(z, x + 1, y + 1, { minX: midX, minY: midY, maxX, maxY })          // NE (Top-Right, Odd Y)
+      new TileNode(z, x, y, { minX, minY, maxX: midX, maxY: midY }),                 // Bottom-Left (Even Y)
+      new TileNode(z, x + 1, y, { minX: midX, minY, maxX, maxY: midY }),             // Bottom-Right (Even Y)
+      new TileNode(z, x, y + 1, { minX, minY: midY, maxX: midX, maxY }),             // Top-Left (Odd Y)
+      new TileNode(z, x + 1, y + 1, { minX: midX, minY: midY, maxX, maxY })          // Top-Right (Odd Y)
     ];
     
     // Register in nodeMap for semantic updates

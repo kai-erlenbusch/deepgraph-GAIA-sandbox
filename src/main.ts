@@ -13,33 +13,34 @@ const TILE_SERVER_URL = 'https://files.benschmidt.org/tiles/gaia';
 
 
 
-import { Scatterplot } from './Scatterplot';
-import { Renderer } from './core/Renderer';
-
 let is2DMode = true; // 2D by default
+import { Scatterplot } from './Scatterplot';
 let rendererInstance: Renderer | null = null;
 let scatterplotInstance: Scatterplot | null = null;
 
-(window as any).swapMode = () => {
-  is2DMode = !is2DMode;
-  if (scatterplotInstance) {
-    scatterplotInstance.layerSpacingUniform.value = is2DMode ? 0.0 : 1.0;
-  }
-  if (rendererInstance) {
-    rendererInstance.set2DMode(is2DMode);
-  }
-  
+function setupModeSwap() {
   const btn = document.getElementById('swap-mode-btn');
   if (btn) {
-    btn.innerText = `Mode: ${is2DMode ? '2D' : '2.5D'}`;
+    btn.addEventListener('click', () => {
+      is2DMode = !is2DMode;
+      if (scatterplotInstance) {
+        scatterplotInstance.layerSpacingUniform.value = is2DMode ? 0.0 : 1.0;
+      }
+      if (rendererInstance) {
+        rendererInstance.set2DMode(is2DMode);
+      }
+      btn.innerText = `Mode: ${is2DMode ? '2D' : '2.5D'}`;
+    });
   }
-};
+}
 
 
 
 async function init() {
   const container = document.getElementById('app')!;
   const uiText = document.querySelector('#ui p')!;
+
+  setupModeSwap();
 
   if (!navigator.gpu) {
     uiText.textContent = 'WebGPU is not supported by your browser.';
@@ -148,6 +149,8 @@ async function init() {
     });
   }
 
+  // DISABLED TEMPORARILY: Hover tooltip and magnification
+  /*
   let isPickingScheduled = false;
   window.addEventListener('mousemove', (e) => {
     mouse.x = e.clientX;
@@ -162,6 +165,7 @@ async function init() {
       });
     }
   });
+  */
 
   // Connect TileManager's Cache Eviction to Scatterplot's GPU slots
   tileManager.onTileUnloaded = (tileId: string) => {
@@ -170,24 +174,61 @@ async function init() {
 
   rendererWrapper.renderer.setAnimationLoop(() => {
     try {
-      // 1. Get frustum
+      const t0 = performance.now();
+      
+      // 1. Get frustum and calculate max importance limit
       const frustum = rendererWrapper.getFrustum();
-      // 2. Fetch visible tiles (synchronously triggers background fetches)
-      const visibleTiles = tileManager.getVisibleTiles(frustum, rendererWrapper.camera);
+      const currentMaxIx = scatterplot.calculateMaxIx(rendererWrapper.camera as THREE.OrthographicCamera);
+      
+      // 2. Fetch visible tiles with CPU Zero-Cost Culling
+      const visibleTiles = tileManager.getVisibleTiles(frustum, rendererWrapper.camera as THREE.OrthographicCamera, currentMaxIx);
+      
+      const t1 = performance.now();
       
       // 3. Update scatterplot geometry and compute nodes
       scatterplot.updateTiles(visibleTiles);
+      
+      const t2 = performance.now();
       
       let totalPoints = 0;
       for (const t of visibleTiles) totalPoints += t.numRows;
       uiText.innerHTML = `Streaming Quadtree<br/>Tiles rendered: ${visibleTiles.length}<br/>Points: ${totalPoints}`;
 
-      // 4. Dispatch Compute Shaders (Removed)
+      // 4. Update Camera
       scatterplot.updateCamera(rendererWrapper.camera);
+
+      const t3 = performance.now();
 
       // 5. Render Main Scene
       rendererWrapper.render();
+      
+      const t4 = performance.now();
       stats.update();
+      
+      // TELEMETRY
+      const w = window as any;
+      w.perfAccum = w.perfAccum || { frames: 0, getVisibleTiles: 0, updateTiles: 0, updateCam: 0, render: 0, totalFrame: 0, lastReport: performance.now() };
+      w.perfAccum.frames++;
+      w.perfAccum.getVisibleTiles += (t1 - t0);
+      w.perfAccum.updateTiles += (t2 - t1);
+      w.perfAccum.updateCam += (t3 - t2);
+      w.perfAccum.render += (t4 - t3);
+      w.perfAccum.totalFrame += (t4 - t0);
+      
+      if (t4 - w.perfAccum.lastReport >= 1000) {
+         const p = w.perfAccum;
+         const data = {
+            fps: p.frames,
+            tiles: visibleTiles.length,
+            getVisibleTiles: (p.getVisibleTiles / p.frames).toFixed(1),
+            updateTiles: (p.updateTiles / p.frames).toFixed(1),
+            updateCam: (p.updateCam / p.frames).toFixed(1),
+            render: (p.render / p.frames).toFixed(1),
+            totalFrame: (p.totalFrame / p.frames).toFixed(1)
+         };
+         fetch('http://localhost:8081/log', { method: 'POST', body: JSON.stringify(data) }).catch(e => {});
+         w.perfAccum = { frames: 0, getVisibleTiles: 0, updateTiles: 0, updateCam: 0, render: 0, totalFrame: 0, lastReport: t4 };
+      }
     } catch (err) {
       console.error("Animation loop crash:", err);
       rendererWrapper.renderer.setAnimationLoop(null); // Stop loop to avoid 3000 errors

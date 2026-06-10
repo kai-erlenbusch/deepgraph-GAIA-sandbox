@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { MeshBasicNodeMaterial, StorageInstancedBufferAttribute } from 'three/webgpu';
 import { 
   attribute, float, positionLocal, vec3, vec4, vec2, uv, distance, smoothstep,
-  hash, instanceIndex, max, select, uint, mix, clamp, log2, uniform, varying, instancedArray, storage, cameraProjectionMatrix, cameraViewMatrix, atomicAdd, time
+  hash, instanceIndex, max, select, uint, mix, clamp, log2, uniform, varying, instancedArray, storage, cameraProjectionMatrix, cameraViewMatrix, atomicAdd, time, userData
 } from 'three/tsl';
 import { Renderer } from './core/Renderer';
 import { BoundingBox, TileData } from './data/TileManager';
@@ -15,8 +15,9 @@ export class Scatterplot {
   public rowsPerTile = 65536;
   public maxGlobalRows = this.maxTiles * this.rowsPerTile;
   
-  public globalMesh: THREE.Mesh;
+  public slotMeshes: THREE.Mesh[] = [];
   public slotToTileKey: string[] = new Array(this.maxTiles).fill('');
+  public slotToTileData: (TileData | null)[] = new Array(this.maxTiles).fill(null);
   public tileKeyToSlot: Map<string, number> = new Map();
   public globalHoverBuffer: Int32Array = new Int32Array(this.maxGlobalRows * 3);
   
@@ -64,39 +65,45 @@ export class Scatterplot {
       minFilter: THREE.NearestFilter
     });
 
-    // 1. Pre-allocate exactly one global mesh to handle up to 800 tiles (52 million points)
-    const instancedGeometry = new THREE.InstancedBufferGeometry();
-    instancedGeometry.index = this.quadGeometry.index;
-    instancedGeometry.attributes.position = this.quadGeometry.attributes.position;
-    instancedGeometry.attributes.uv = this.quadGeometry.attributes.uv;
-    
-    instancedGeometry.setAttribute('offsetX', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('offsetY', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('pointIx', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('instanceColor', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('instanceSize', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows), 1));
-    instancedGeometry.setAttribute('spawnTime', new StorageInstancedBufferAttribute(new Float32Array(this.maxGlobalRows).fill(-1000.0), 1));
-    
-    instancedGeometry.instanceCount = this.maxGlobalRows;
+    // 1. Pre-allocate 800 discrete meshes, perfectly chunking the geometry
+    const mainMaterial = this.createMainMaterial();
+    const pickingMaterial = this.createPickingMaterial();
 
-    this.globalMesh = new THREE.Mesh(instancedGeometry, null as any);
-    this.globalMesh.frustumCulled = false; // We do our own GPU culling
+    for (let i = 0; i < this.maxTiles; i++) {
+        const geo = new THREE.InstancedBufferGeometry();
+        geo.index = this.quadGeometry.index;
+        geo.attributes.position = this.quadGeometry.attributes.position;
+        geo.attributes.uv = this.quadGeometry.attributes.uv;
+        
+        // Use standard WebGPU Instanced Attributes
+        geo.setAttribute('offsetX', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile), 1));
+        geo.setAttribute('offsetY', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile), 1));
+        geo.setAttribute('pointIx', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile), 1));
+        geo.setAttribute('instanceColor', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile), 1));
+        geo.setAttribute('instanceSize', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile), 1));
+        geo.setAttribute('spawnTime', new THREE.InstancedBufferAttribute(new Float32Array(this.rowsPerTile).fill(-1000.0), 1));
+        
+        geo.instanceCount = 0; // Initialize empty to prevent garbage rendering
 
-    // Setup Materials (1 Main, 1 Picking)
-    this.globalMesh.material = this.createMainMaterial(instancedGeometry);
-    this.globalMesh.userData.pickingMaterial = this.createPickingMaterial(instancedGeometry);
+        const mesh = new THREE.Mesh(geo, mainMaterial);
+        mesh.frustumCulled = false; // We do our own Zero-Cost GPU culling via mesh.visible
+        mesh.visible = false;
+        mesh.userData.pickingMaterial = pickingMaterial;
+        mesh.userData.slotIndex = i; // Assign Slot ID natively for picking shader
 
-    this.scene.add(this.globalMesh);
+        this.slotMeshes.push(mesh);
+        this.scene.add(mesh);
+    }
   }
 
-  private createMainMaterial(geo: THREE.InstancedBufferGeometry) {
-    // Color is now a Float32Array storing bp_rp values
-    const colorBuffer = storage(geo.attributes.instanceColor, 'float', this.maxGlobalRows).toReadOnly();
-    const sizeBuffer = storage(geo.attributes.instanceSize, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetXBuffer = storage(geo.attributes.offsetX, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetYBuffer = storage(geo.attributes.offsetY, 'float', this.maxGlobalRows).toReadOnly();
-    const pointIxBuffer = storage(geo.attributes.pointIx, 'float', this.maxGlobalRows).toReadOnly();
-    const spawnTimeBuffer = storage(geo.attributes.spawnTime, 'float', this.maxGlobalRows).toReadOnly();
+  private createMainMaterial() {
+    // Abstracted TSL inputs allow ALL 800 meshes to perfectly share this 1 Pipeline!
+    const rawColor = attribute('instanceColor', 'float');
+    const rawMag = attribute('instanceSize', 'float');
+    const offsetX = attribute('offsetX', 'float');
+    const offsetY = attribute('offsetY', 'float');
+    const pointIx = attribute('pointIx', 'float');
+    const spawnTime = attribute('spawnTime', 'float');
 
     const mat = new MeshBasicNodeMaterial({
       transparent: true,
@@ -113,10 +120,6 @@ export class Scatterplot {
     const zoomT = this.rendererWrapper.zoomTUniform;
     const targetPixels = mix(float(1.0), float(2.0), zoomT);
     
-    // Read raw attributes
-    const rawMag = sizeBuffer.element(instanceIndex);
-    const rawColor = colorBuffer.element(instanceIndex);
-    
     // Handle NaNs natively in the shader (NaN != NaN is True)
     const isMagNaN = rawMag.equal(rawMag).not();
     const safeRawMag = select(isMagNaN, float(20.0), rawMag);
@@ -124,12 +127,16 @@ export class Scatterplot {
     const isColorNaN = rawColor.equal(rawColor).not();
     const safeRawColor = select(isColorNaN, float(0.0), rawColor);
     
-    // Scale and cap the base size (using safeRawMag)
-    const computedSize = max(float(0.05), float(21.0).sub(safeRawMag).div(float(10.0)));
+    // Scale and cap the base size 
+    // We gracefully handle both GAIA magnitude (<= 21) and Nomic tokens (> 30)
+    const isTokens = safeRawMag.greaterThan(30.0);
+    const tokenSize = max(float(0.5), log2(max(safeRawMag, float(1.0))));
+    const gaiaSize = max(float(0.05), float(21.0).sub(safeRawMag).div(float(10.0)));
+    const computedSize = select(isTokens, tokenSize, gaiaSize);
+    
     const instanceSize = mix(float(0.8), float(3.0), zoomT).mul(computedSize);
     
-    const pointIx = pointIxBuffer.element(instanceIndex);
-    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0)
+    const isVisible = rawMag.greaterThan(0.0)
                       .and(pointIx.lessThanEqual(this.maxIxUniform));
     const safeSize = select(isVisible, targetPixels.mul(this.rendererWrapper.worldUnitsPerPixelUniform).mul(instanceSize), float(0.0));
     
@@ -170,7 +177,6 @@ export class Scatterplot {
     const probDiscard = randomVal.greaterThan(finalAlpha.mul(float(255.0)));
     
     // Opacity Fade-in
-    const spawnTime = spawnTimeBuffer.element(instanceIndex);
     const age = time.sub(spawnTime);
     const fadeAlpha = smoothstep(0.0, 0.3, age);
     
@@ -180,17 +186,17 @@ export class Scatterplot {
     mat.colorNode = baseColor.mul(safeAlpha);
     mat.opacityNode = safeAlpha;
     
-    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), float(0.0));
+    const offset3D = vec3(offsetX, offsetY, float(0.0));
     mat.positionNode = select(isVisible, offset3D.add(positionLocal.mul(safeSize)), vec3(1000000.0));
 
     return mat;
   }
 
-  private createPickingMaterial(geo: THREE.InstancedBufferGeometry) {
-    const sizeBuffer = storage(geo.attributes.instanceSize, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetXBuffer = storage(geo.attributes.offsetX, 'float', this.maxGlobalRows).toReadOnly();
-    const offsetYBuffer = storage(geo.attributes.offsetY, 'float', this.maxGlobalRows).toReadOnly();
-    const pointIxBuffer = storage(geo.attributes.pointIx, 'float', this.maxGlobalRows).toReadOnly();
+  private createPickingMaterial() {
+    const rawMag = attribute('instanceSize', 'float');
+    const offsetX = attribute('offsetX', 'float');
+    const offsetY = attribute('offsetY', 'float');
+    const pointIx = attribute('pointIx', 'float');
 
     const mat = new MeshBasicNodeMaterial({
       transparent: true,
@@ -204,7 +210,11 @@ export class Scatterplot {
     // Encode global sortedIndex as a 32-bit Integer packed into RGBA
     // We add 0x01000000 so the 4th byte (Alpha) is ALWAYS >= 1. 
     // This perfectly bypasses alphaTest=0.001 for valid pixels, but lets us output 0.0 alpha to trigger native Discard!
-    const fInstanceIndex = uint(instanceIndex).add(0x01000000);
+    
+    // TSL native userData pulls slotIndex dynamically without material clones
+    const slotIndexNode = userData('slotIndex', 'uint');
+    const globalInstanceIndex = slotIndexNode.mul(this.rowsPerTile).add(uint(instanceIndex));
+    const fInstanceIndex = globalInstanceIndex.add(0x01000000);
     
     const r = float(fInstanceIndex.bitAnd(0xFF)).div(255.0);
     const g = float(fInstanceIndex.shiftRight(8).bitAnd(0xFF)).div(255.0);
@@ -213,8 +223,7 @@ export class Scatterplot {
     
     mat.colorNode = vec3(r, g, b);
     
-    const pointIx = pointIxBuffer.element(instanceIndex);
-    const isVisible = sizeBuffer.element(instanceIndex).greaterThan(0.0)
+    const isVisible = rawMag.greaterThan(0.0)
                       .and(pointIx.lessThanEqual(this.maxIxUniform));
     const distanceToCenter = distance(uv(), vec2(0.5));
     const shouldDiscard = distanceToCenter.greaterThan(0.5).or(isVisible.not());
@@ -222,13 +231,22 @@ export class Scatterplot {
     
     const zoomT = this.rendererWrapper.zoomTUniform;
     const targetPixels = mix(float(1.0), float(2.0), zoomT);
-    const instanceSize = mix(float(0.8), float(3.0), zoomT).mul(sizeBuffer.element(instanceIndex));
+    const instanceSize = mix(float(0.8), float(3.0), zoomT).mul(rawMag);
     const safeSize = targetPixels.mul(this.rendererWrapper.worldUnitsPerPixelUniform).mul(instanceSize);
 
-    const offset3D = vec3(offsetXBuffer.element(instanceIndex), offsetYBuffer.element(instanceIndex), float(0.0));
+    const offset3D = vec3(offsetX, offsetY, float(0.0));
     mat.positionNode = select(isVisible, offset3D.add(positionLocal.mul(safeSize)), vec3(1000000.0));
 
     return mat;
+  }
+
+  public calculateMaxIx(camera: THREE.OrthographicCamera): number {
+    const visibleWidth = (camera.right - camera.left) / camera.zoom;
+    const visibleHeight = (camera.top - camera.bottom) / camera.zoom;
+    const visibleArea = visibleWidth * visibleHeight;
+    const safeRootArea = this.rootArea > 0 ? this.rootArea : 1;
+    const areaRatio = safeRootArea / visibleArea;
+    return 3000000 * areaRatio;
   }
 
   public updateCamera(camera: THREE.Camera) {
@@ -238,20 +256,10 @@ export class Scatterplot {
     
     // Dynamic Density Culling (Progressive Subsampling)
     const orthoCam = camera as THREE.OrthographicCamera;
-    const visibleWidth = (orthoCam.right - orthoCam.left) / camera.zoom;
-    const visibleHeight = (orthoCam.top - orthoCam.bottom) / camera.zoom;
-    
-    // Scale-invariant zoom calculation
     const currentZoom = Math.log2(Math.max(1.0, camera.zoom));
     const zoomT = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
     
-    // Maintain a constant density of roughly 3M points across the visible screen
-    const visibleArea = visibleWidth * visibleHeight;
-    const safeRootArea = this.rootArea > 0 ? this.rootArea : 1;
-    const areaRatio = safeRootArea / visibleArea;
-    
-    const targetPointsOnScreen = 3000000;
-    this.maxIxUniform.value = targetPointsOnScreen * areaRatio;
+    this.maxIxUniform.value = this.calculateMaxIx(orthoCam);
   }
 
     private getFreeSlot(): number {
@@ -261,63 +269,35 @@ export class Scatterplot {
       return -1;
     }
 
-    private writeToGPUBuffer(attribute: StorageInstancedBufferAttribute, dstByteOffset: number, data: ArrayBuffer, srcByteOffset: number, byteLength: number): boolean {
-      try {
-        const backend = (this.rendererWrapper.renderer as any).backend;
-        if (!backend) return false;
-        const gpuData = backend.get(attribute);
-        if (gpuData && gpuData.buffer) {
-            const device = backend.device as GPUDevice;
-            device.queue.writeBuffer(gpuData.buffer, dstByteOffset, data, srcByteOffset, byteLength);
-            return true;
-        }
-      } catch(e) {
-         // Fallback on error
-      }
-      return false;
-    }
-
     private globalZeroBuffer: ArrayBuffer = new Float32Array(this.rowsPerTile).buffer;
 
     public unloadTile(key: string) {
         const slot = this.tileKeyToSlot.get(key);
         if (slot !== undefined) {
             this.slotToTileKey[slot] = '';
+            this.slotToTileData[slot] = null;
             this.tileKeyToSlot.delete(key);
-            
-            const sizeAttr = this.globalMesh.geometry.attributes.instanceSize as StorageInstancedBufferAttribute;
-            const offset = slot * this.rowsPerTile;
-            
-            const wrote = this.writeToGPUBuffer(sizeAttr, offset * 4, this.globalZeroBuffer, 0, this.globalZeroBuffer.byteLength);
-            if (!wrote) {
-                (sizeAttr.array as Float32Array).fill(0.0, offset, offset + this.rowsPerTile);
-                sizeAttr.needsUpdate = true;
-            }
+            this.slotMeshes[slot].visible = false;
         }
     }
 
     public updateTiles(tiles: TileData[]) {
         const currentKeys = new Set(tiles.map(t => t.key));
         
-        // We remove the contiguous MAX_UPDATE_ROWS limit because disjoint writeBuffer calls 
-        // solve the PCIe over-fetching natively. We can process more tiles per frame safely.
-        const MAX_PROCESS_TILES = 20; 
+        // PCIe Throttling: Lower max updates to prevent 30MB bandwidth spikes during fast panning
+        const MAX_PROCESS_TILES = 4; 
         let processedTiles = 0;
-        
-        let minUpdateOffset = Infinity;
-        let maxUpdateOffset = -1;
-        let needsFallbackUpdate = false;
-
-        let maxSlotUsed = -1;
-        for (let i = 0; i < this.maxTiles; i++) {
-            if (this.slotToTileKey[i] !== '') maxSlotUsed = i;
-        }
 
         // 1. Identify tiles that are currently on GPU but no longer active
         for (const [key, slot] of this.tileKeyToSlot.entries()) {
             if (!currentKeys.has(key)) {
                 this.unloadTile(key);
             }
+        }
+        
+        // Ensure only currently visible tiles are drawn! (Zero-Cost Culling)
+        for (let i = 0; i < this.maxTiles; i++) {
+            this.slotMeshes[i].visible = false;
         }
 
     // 2. Process added/updated tiles
@@ -328,85 +308,61 @@ export class Scatterplot {
         
         this.tileKeyToSlot.set(tile.key, slot);
         this.slotToTileKey[slot] = tile.key;
+        this.slotToTileData[slot] = tile;
         tile.needsUpdate = true;
+        
+        // Prevent drawing garbage from a previous tile in this slot
+        const geo = this.slotMeshes[slot].geometry as THREE.InstancedBufferGeometry;
+        geo.instanceCount = 0;
       }
       
       const slot = this.tileKeyToSlot.get(tile.key)!;
-      if (slot > maxSlotUsed) maxSlotUsed = slot;
+      const geo = this.slotMeshes[slot].geometry as THREE.InstancedBufferGeometry;
 
       if (tile.needsUpdate) {
-        if (processedTiles >= MAX_PROCESS_TILES) continue;
+        if (processedTiles >= MAX_PROCESS_TILES) {
+             this.slotMeshes[slot].visible = geo.instanceCount > 0;
+             continue;
+        }
         processedTiles++;
         
-        const offset = slot * this.rowsPerTile;
-        const geo = this.globalMesh.geometry;
-        
-        let tileNeedsFallback = false;
+        geo.instanceCount = tile.numRows;
         
         if (tile.xBuffer) {
-            const ixBuf = tile.ixBuffer || new Float32Array(this.rowsPerTile).buffer;
-            const wroteX = this.writeToGPUBuffer(geo.attributes.offsetX as StorageInstancedBufferAttribute, offset * 4, tile.xBuffer, 0, tile.xBuffer.byteLength);
-            if (wroteX) {
-                this.writeToGPUBuffer(geo.attributes.offsetY as StorageInstancedBufferAttribute, offset * 4, tile.yBuffer!, 0, tile.yBuffer!.byteLength);
-                this.writeToGPUBuffer(geo.attributes.pointIx as StorageInstancedBufferAttribute, offset * 4, ixBuf, 0, ixBuf.byteLength);
-            } else {
-                (geo.attributes.offsetX as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.xBuffer), offset);
-                (geo.attributes.offsetY as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.yBuffer!), offset);
-                (geo.attributes.pointIx as StorageInstancedBufferAttribute).array.set(new Float32Array(ixBuf), offset);
-                needsFallbackUpdate = true;
-                tileNeedsFallback = true;
-            }
+            (geo.attributes.offsetX.array as Float32Array).set(new Float32Array(tile.xBuffer));
+            geo.attributes.offsetX.needsUpdate = true;
+
+            (geo.attributes.offsetY.array as Float32Array).set(new Float32Array(tile.yBuffer!));
+            geo.attributes.offsetY.needsUpdate = true;
+
+            const ixBuf = tile.ixBuffer || new Float32Array(tile.numRows).buffer;
+            (geo.attributes.pointIx.array as Float32Array).set(new Float32Array(ixBuf));
+            geo.attributes.pointIx.needsUpdate = true;
         }
         
         if (tile.colorBuffer) {
             const currentTime = performance.now() / 1000.0;
-            const spawnTimeArray = new Float32Array(this.rowsPerTile).fill(currentTime);
+            const spawnTimeArray = new Float32Array(tile.numRows).fill(currentTime);
 
-            const wroteC = this.writeToGPUBuffer(geo.attributes.instanceColor as StorageInstancedBufferAttribute, offset * 4, tile.colorBuffer, 0, tile.colorBuffer.byteLength);
-            if (wroteC) {
-                this.writeToGPUBuffer(geo.attributes.instanceSize as StorageInstancedBufferAttribute, offset * 4, tile.sizeBuffer!, 0, tile.sizeBuffer!.byteLength);
-                this.writeToGPUBuffer(geo.attributes.spawnTime as StorageInstancedBufferAttribute, offset * 4, spawnTimeArray.buffer, 0, spawnTimeArray.byteLength);
-            } else {
-                (geo.attributes.instanceColor as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.colorBuffer), offset);
-                (geo.attributes.instanceSize as StorageInstancedBufferAttribute).array.set(new Float32Array(tile.sizeBuffer!), offset);
-                (geo.attributes.spawnTime as StorageInstancedBufferAttribute).array.set(spawnTimeArray, offset);
-                needsFallbackUpdate = true;
-                tileNeedsFallback = true;
-            }
+            (geo.attributes.instanceColor.array as Float32Array).set(new Float32Array(tile.colorBuffer));
+            geo.attributes.instanceColor.needsUpdate = true;
+
+            (geo.attributes.instanceSize.array as Float32Array).set(new Float32Array(tile.sizeBuffer!));
+            geo.attributes.instanceSize.needsUpdate = true;
+
+            (geo.attributes.spawnTime.array as Float32Array).set(spawnTimeArray);
+            geo.attributes.spawnTime.needsUpdate = true;
         }
         
         if (tile.hoverBuffer) {
+            const offset = slot * this.rowsPerTile;
             this.globalHoverBuffer.set(new Int32Array(tile.hoverBuffer), offset * 3);
-        }
-
-        if (tileNeedsFallback) {
-            minUpdateOffset = Math.min(minUpdateOffset, offset);
-            maxUpdateOffset = Math.max(maxUpdateOffset, offset + this.rowsPerTile);
         }
 
         tile.needsUpdate = false;
       }
-    }
-
-    if (needsFallbackUpdate && maxUpdateOffset > -1) {
-        const geo = this.globalMesh.geometry;
-        const updateCount = maxUpdateOffset - minUpdateOffset;
-        const range = { offset: minUpdateOffset, count: updateCount };
-        
-        const attrs = ['offsetX', 'offsetY', 'pointIx', 'instanceColor', 'instanceSize', 'spawnTime'];
-        for (const attr of attrs) {
-            const a = geo.attributes[attr] as StorageInstancedBufferAttribute;
-            a.updateRange = range;
-            a.needsUpdate = true;
-        }
-    }
-    
-    // We can shrink the instanceCount to save vertex shader invocations on empty top end!
-    if (maxSlotUsed >= 0) {
-        const activeRows = (maxSlotUsed + 1) * this.rowsPerTile;
-        this.globalMesh.geometry.instanceCount = activeRows;
-    } else {
-        this.globalMesh.geometry.instanceCount = 0;
+      
+      this.slotMeshes[slot].visible = geo.instanceCount > 0;
     }
   }
 
@@ -425,12 +381,18 @@ export class Scatterplot {
         return;
       }
   
-      const offsetX = (this.globalMesh.geometry.attributes.offsetX as StorageInstancedBufferAttribute).array as Float32Array;
-      const offsetY = (this.globalMesh.geometry.attributes.offsetY as StorageInstancedBufferAttribute).array as Float32Array;
-      const sizeBuffer = (this.globalMesh.geometry.attributes.instanceSize as StorageInstancedBufferAttribute).array as Float32Array;
+      const tile = this.slotToTileData[slotIndex];
+      if (!tile || !tile.xBuffer || !tile.yBuffer || !tile.sizeBuffer) {
+          this.hoverMesh.visible = false;
+          return;
+      }
+
+      const offsetX = new Float32Array(tile.xBuffer);
+      const offsetY = new Float32Array(tile.yBuffer);
+      const sizeBuffer = new Float32Array(tile.sizeBuffer);
       
-      const x = offsetX[globalId];
-      const y = offsetY[globalId];
+      const x = offsetX[rowIndex];
+      const y = offsetY[rowIndex];
       this.hoverMesh.position.set(x, y, 0.0);
       
       // Sync hover scale precisely with the visual shader scale
@@ -438,9 +400,16 @@ export class Scatterplot {
       const zoomT = Math.max(0, Math.min(1.0, currentZoom / 6.0));
       const targetPixels = 1.0 * (1.0 - zoomT) + 2.0 * zoomT;
       const baseInstanceSize = 0.8 * (1.0 - zoomT) + 3.0 * zoomT;
-      const instanceSize = sizeBuffer[globalId];
+      const rawMag = sizeBuffer[rowIndex];
       
-      const physicalSize = targetPixels * baseInstanceSize * instanceSize * worldUnitsPerPixel * 4.0;
+      let computedSize = 0;
+      if (rawMag > 30.0) {
+          computedSize = Math.max(0.5, Math.log2(Math.max(rawMag, 1.0)));
+      } else {
+          computedSize = Math.max(0.05, (21.0 - rawMag) / 10.0);
+      }
+      
+      const physicalSize = targetPixels * baseInstanceSize * computedSize * this.rendererWrapper.worldUnitsPerPixelUniform.value * 4.0;
       this.hoverMesh.scale.set(physicalSize, physicalSize, 1.0);
       
       this.hoverMesh.visible = true;

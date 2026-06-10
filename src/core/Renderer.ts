@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { WebGPURenderer } from 'three/webgpu';
-import { uniform } from 'three/tsl';
+import { WebGPURenderer, PostProcessing } from 'three/webgpu';
+import { uniform, pass } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 export class Renderer {
@@ -13,6 +13,7 @@ export class Renderer {
   public worldUnitsPerPixelUniform = uniform(0.001);
   public zoomTUniform = uniform(0.0);
   public pmremGenerator: THREE.PMREMGenerator | null = null;
+  public postProcessing: PostProcessing | null = null;
 
   private raycaster = new THREE.Raycaster();
   private mouse = new THREE.Vector2();
@@ -135,6 +136,7 @@ export class Renderer {
     this.camera.bottom = -frustumSize / 2;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
+    // PostProcessing handles resize automatically through the renderer size in r171
   }
 
   public getFrustum(): THREE.Frustum {
@@ -160,10 +162,30 @@ export class Renderer {
     const currentZoom = Math.log2(Math.max(1.0, this.camera.zoom));
     this.zoomTUniform.value = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
     
-    this.renderer.render(this.scene, this.camera);
+    if (this.postProcessing) {
+      this.postProcessing.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
   }
 
   public async init() {
     await this.renderer.init();
+    
+    // Set up HDR render target for additive blending accumulation
+    const renderTarget = new THREE.RenderTarget(window.innerWidth, window.innerHeight, {
+      type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat,
+    });
+    
+    this.postProcessing = new PostProcessing(this.renderer);
+    
+    const scenePass = pass(this.scene, this.camera);
+    
+    // Apply ACES Filmic tone mapping to properly map unbounded additive density
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
+    
+    this.postProcessing.outputNode = scenePass;
   }
 }

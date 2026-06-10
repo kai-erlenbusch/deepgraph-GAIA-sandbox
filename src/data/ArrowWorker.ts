@@ -80,19 +80,26 @@ self.onmessage = async (e: MessageEvent) => {
     
     const ixCol = table.getChild('ix');
     let ixBuffer: ArrayBuffer;
+    let minIx = Infinity;
+    let maxIx = -Infinity;
     if (ixCol) {
         const rawArray = ixCol.toArray();
         const floatArray = new Float32Array(numRows);
         for (let i = 0; i < numRows; i++) {
-            floatArray[i] = rawArray[i] == null ? 0 : Number(rawArray[i]);
+            const val = rawArray[i] == null ? 0 : Number(rawArray[i]);
+            floatArray[i] = val;
+            if (val < minIx) minIx = val;
+            if (val > maxIx) maxIx = val;
         }
         ixBuffer = floatArray.buffer;
     } else {
         ixBuffer = new Float32Array(numRows).buffer;
+        minIx = 0;
+        maxIx = 0;
     }
     
     self.postMessage(
-      { key, stage: 'geom', xBuffer, yBuffer, ixBuffer, numRows, childrenKeys, extent }, 
+      { key, stage: 'geom', xBuffer, yBuffer, ixBuffer, numRows, childrenKeys, extent, minIx, maxIx }, 
       { transfer: [xBuffer, yBuffer, ixBuffer] }
     );
     
@@ -116,12 +123,16 @@ self.onmessage = async (e: MessageEvent) => {
     let sizeBuffer: ArrayBuffer;
     if (magCol) {
         sizeBuffer = getBuffer(magCol);
-    } else if (tokensArray) {
-        const floatSizes = new Float32Array(numRows);
-        for (let i = 0; i < numRows; i++) {
-            floatSizes[i] = Math.max(0.5, Math.log10(Math.max(Number(tokensArray[i]), 1)));
+    } else if (tokensCol && tokensArray) {
+        if (tokensArray instanceof Float32Array) {
+            sizeBuffer = getBuffer(tokensCol);
+        } else {
+            const floatSizes = new Float32Array(numRows);
+            for (let i = 0; i < numRows; i++) {
+                floatSizes[i] = Number(tokensArray[i]);
+            }
+            sizeBuffer = floatSizes.buffer;
         }
-        sizeBuffer = floatSizes.buffer;
     } else {
         sizeBuffer = new Float32Array(numRows).fill(20.0).buffer;
     }
